@@ -5,7 +5,8 @@ from typing import Union
 
 from pyrogram import Client
 from pyrogram.types import InlineKeyboardMarkup
-from pytgcalls import PyTgCalls, StreamType
+from pytgcalls import PyTgCalls
+from pytgcalls.implementation import StreamType
 from pytgcalls.exceptions import (
     AlreadyJoinedError,
     NoActiveGroupCall,
@@ -159,11 +160,11 @@ class Call(PyTgCalls):
             if not os.path.isfile(out):
                 if str(speed) == str("0.5"):
                     vs = 2.0
-                if str(speed) == str("0.75"):
+                elif str(speed) == str("0.75"):
                     vs = 1.35
-                if str(speed) == str("1.5"):
+                elif str(speed) == str("1.5"):
                     vs = 0.68
-                if str(speed) == str("2.0"):
+                elif str(speed) == str("2.0"):
                     vs = 0.5
                 proc = await asyncio.create_subprocess_shell(
                     cmd=(
