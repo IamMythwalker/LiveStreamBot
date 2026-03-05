@@ -12,7 +12,7 @@ numpy
 opencv-python
 pillow==9.5.0
 psutil
-py-tgcalls==0.9.7
+pytgcalls==0.9.7
 pytgcrypto
 kurigram
 python-dotenv
@@ -27,3 +27,4 @@ youtube-search
 youtube-search-python
 ntgcalls
 flask
+
