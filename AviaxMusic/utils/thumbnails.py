@@ -10,7 +10,7 @@ import aiohttp
 import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 from youtubesearchpython.__future__ import VideosSearch
-from config import FAILED
+#from config import FAILED
 from py_yt import VideosSearch
 
 logging.basicConfig(level=logging.INFO)
@@ -234,4 +234,5 @@ async def gen_thumb(videoid: str) -> str:
     except Exception as e:
         logging.error(f"Error generating thumbnail for video {videoid}: {e}")
         traceback.print_exc()
+
         return None
