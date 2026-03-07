@@ -69,8 +69,8 @@ def stream_markup_timer(_, chat_id, played, dur):
         ],
         [
             InlineKeyboardButton(
-                text="Add me in Your Group",
-                url=f"https://t.me/{app.username}?start=promo"
+                text="ᴀᴅᴅ ʙᴏᴛ ᴛᴏ ɢʀᴏᴜᴘ",
+                url=f"https://t.me/{app.username}?startgroup=true"
             )
         ],
         [InlineKeyboardButton(text=_["CLOSE_BUTTON"], callback_data="close")],
@@ -89,8 +89,8 @@ def stream_markup(_, chat_id):
         ],
         [
             InlineKeyboardButton(
-                text="Add me in Your Group",
-                url=f"https://t.me/{app.username}?start=promo"
+                text="ᴀᴅᴅ ʙᴏᴛ ᴛᴏ ɢʀᴏᴜᴘ",
+                url=f"https://t.me/{app.username}?startgroup=true"
             )
         ],
         [InlineKeyboardButton(text=_["CLOSE_BUTTON"], callback_data="close")],
