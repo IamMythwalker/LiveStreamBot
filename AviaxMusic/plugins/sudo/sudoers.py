@@ -47,25 +47,26 @@ async def userdel(client, message: Message, _):
 @app.on_message(filters.command(["sudolist", "listsudo", "sudoers"]) & ~BANNED_USERS)
 @language
 async def sudoers_list(client, message: Message, _):
-    text = _["sudo_5"]
-    user = await app.get_users(OWNER_ID)
-    user = user.first_name if not user.mention else user.mention
-    text += f"1➤ {user}\n"
-    count = 0
-    smex = 0
-    for user_id in SUDOERS:
-        if user_id != OWNER_ID:
-            try:
-                user = await app.get_users(user_id)
-                user = user.first_name if not user.mention else user.mention
-                if smex == 0:
-                    smex += 1
-                    text += _["sudo_6"]
-                count += 1
-                text += f"{count}➤ {user}\n"
-            except:
-                continue
-    if not text:
-        await message.reply_text(_["sudo_7"])
-    else:
-        await message.reply_text(text, reply_markup=close_markup(_))
+    if message.from_user.id in SUDOERS:
+        text = _["sudo_5"]
+        user = await app.get_users(OWNER_ID)
+        user = user.first_name if not user.mention else user.mention
+        text += f"1➤ {user}\n"
+        count = 0
+        smex = 0
+        for user_id in SUDOERS:
+            if user_id != OWNER_ID:
+                try:
+                    user = await app.get_users(user_id)
+                    user = user.first_name if not user.mention else user.mention
+                    if smex == 0:
+                        smex += 1
+                        text += _["sudo_6"]
+                    count += 1
+                    text += f"{count}➤ {user}\n"
+                except:
+                    continue
+        if not text:
+            await message.reply_text(_["sudo_7"])
+        else:
+            await message.reply_text(text, reply_markup=close_markup(_))
