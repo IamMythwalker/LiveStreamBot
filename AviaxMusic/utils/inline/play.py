@@ -63,7 +63,7 @@ def stream_markup_timer(_, chat_id, played, dur):
         [
             InlineKeyboardButton(
                 text=f"{played} {bar} {dur}",
-                callback_data="GetTimer",style=enums.ButtonStyle.PRIMARY,
+                callback_data="GetTimer"
             )
         ],
         [
@@ -172,4 +172,5 @@ def slider_markup(_, videoid, user_id, query, query_type, channel, fplay):
             ),
         ],
     ]
+
     return buttons
