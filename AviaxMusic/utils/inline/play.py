@@ -1,8 +1,7 @@
 import math
+from pyrogram import enums
 from AviaxMusic import app
-
 from pyrogram.types import InlineKeyboardButton
-
 from AviaxMusic.utils.formatters import time_to_seconds
 
 
@@ -31,34 +30,40 @@ def track_markup(_, videoid, user_id, channel, fplay):
 def stream_markup_timer(_, chat_id, played, dur):
     played_sec = time_to_seconds(played)
     duration_sec = time_to_seconds(dur)
-    percentage = (played_sec / duration_sec) * 100
-    umm = math.floor(percentage)
-    if 0 < umm <= 10:
+    
+    if duration_sec == 0:
+        percentage = 0
         bar = "◉—————————"
-    elif 10 < umm < 20:
-        bar = "—◉————————"
-    elif 20 <= umm < 30:
-        bar = "——◉———————"
-    elif 30 <= umm < 40:
-        bar = "———◉——————"
-    elif 40 <= umm < 50:
-        bar = "————◉—————"
-    elif 50 <= umm < 60:
-        bar = "—————◉————"
-    elif 60 <= umm < 70:
-        bar = "——————◉———"
-    elif 70 <= umm < 80:
-        bar = "———————◉——"
-    elif 80 <= umm < 95:
-        bar = "————————◉—"
     else:
-        bar = "—————————◉"
+        percentage = (played_sec / duration_sec) * 100
+        umm = int(percentage)
+        
+        if umm == 0:
+            bar = "◉—————————"
+        elif umm <= 10:
+            bar = "—◉————————"
+        elif umm <= 20:
+            bar = "——◉———————"
+        elif umm <= 30:
+            bar = "———◉——————"
+        elif umm <= 40:
+            bar = "————◉—————"
+        elif umm <= 50:
+            bar = "—————◉————"
+        elif umm <= 60:
+            bar = "——————◉———"
+        elif umm <= 70:
+            bar = "———————◉——"
+        elif umm <= 80:
+            bar = "————————◉—"
+        else:
+            bar = "—————————◉"
+    
     buttons = [
         [
             InlineKeyboardButton(
                 text=f"{played} {bar} {dur}",
-                callback_data="GetTimer",
-                style=enums.ButtonStyle.PRIMARY,
+                callback_data="GetTimer",style=enums.ButtonStyle.PRIMARY,
             )
         ],
         [
