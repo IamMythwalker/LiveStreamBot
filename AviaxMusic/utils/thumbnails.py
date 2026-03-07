@@ -7,17 +7,19 @@ import os
 import re
 import aiofiles
 import aiohttp
+import traceback
 import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 from youtubesearchpython.__future__ import VideosSearch
-from config import FAILED
-from py_yt import VideosSearch
 
 logging.basicConfig(level=logging.INFO)
 
 CACHE_DIR = "cache" 
 os.makedirs(CACHE_DIR, exist_ok=True) 
- 
+
+# Default fallback thumbnail URL if none provided
+DEFAULT_THUMB = "http://telegraph.controller.bot/files/7994865408/AgACAgUAAxkBAAID52mmsJp71qEEpXWN4um1zY6yUqSJAAJiD2sbNFkxVdj348mCgd56AQADAgADeAADOgQ"  # Replace with your actual fallback URL
+
 # Canvas and Card Settings 
 WIDTH, HEIGHT = 1280, 720 
 CARD_W, CARD_H = 1000, 580 
@@ -149,16 +151,18 @@ async def gen_thumb(videoid: str) -> str:
         if os.path.exists(cache_path): 
             return cache_path 
 
+        # Use the already imported VideosSearch
         results = VideosSearch(f"https://www.youtube.com/watch?v={videoid}", limit=1) 
         try: 
             results_data = await results.next() 
             data = results_data.get("result", [])[0] 
             title = re.sub(r"\W+", " ", data.get("title", "Unsupported Title")).title() 
-            thumbnail = data.get("thumbnails", [{}])[0].get("url", FAILED) 
+            thumbnail = data.get("thumbnails", [{}])[0].get("url", DEFAULT_THUMB) 
             duration = data.get("duration") 
             views = data.get("viewCount", {}).get("short", "Unknown Views") 
-        except Exception: 
-            title, thumbnail, duration, views = "Unsupported Title", FAILED, None, "Unknown Views" 
+        except Exception as e:
+            logging.error(f"Error fetching video data: {e}")
+            title, thumbnail, duration, views = "Unsupported Title", DEFAULT_THUMB, None, "Unknown Views" 
 
         is_live = not duration or str(duration).strip().lower() in {"", "live", "live now"} 
         duration_text = "Live" if is_live else duration or "Unknown Mins" 
@@ -170,8 +174,15 @@ async def gen_thumb(videoid: str) -> str:
                     if resp.status == 200: 
                         async with aiofiles.open(thumb_path, "wb") as f: 
                             await f.write(await resp.read()) 
-        except Exception: 
-            return FAILED 
+                    else:
+                        # Create a blank image if thumbnail download fails
+                        thumb = Image.new('RGB', (THUMB_W, THUMB_H), color='gray')
+                        thumb.save(thumb_path)
+        except Exception as e:
+            logging.error(f"Error downloading thumbnail: {e}")
+            # Create a blank image if thumbnail download fails
+            thumb = Image.new('RGB', (THUMB_W, THUMB_H), color='gray')
+            thumb.save(thumb_path)
 
         # Load and blur background 
         thumb = Image.open(thumb_path).convert("RGB") 
@@ -234,6 +245,4 @@ async def gen_thumb(videoid: str) -> str:
     except Exception as e:
         logging.error(f"Error generating thumbnail for video {videoid}: {e}")
         traceback.print_exc()
-
         return None
-
