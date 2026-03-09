@@ -22,6 +22,7 @@ langdb = mongodb.language
 onoffdb = mongodb.onoffper
 playmodedb = mongodb.playmode
 playtypedb = mongodb.playtypedb
+rtmpdb = mongodb.rtmpcreds
 skipdb = mongodb.skipmode
 sudoersdb = mongodb.sudoers
 usersdb = mongodb.tgusersdb
@@ -41,6 +42,7 @@ nonadmin = {}
 pause = {}
 playmode = {}
 playtype = {}
+rtmp_creds_cache: dict = {}
 skipmode = {}
 
 
@@ -666,3 +668,35 @@ async def remove_banned_user(user_id: int):
     if not is_gbanned:
         return
     return await blockeddb.delete_one({"user_id": user_id})
+
+
+# ── RTMP credential helpers ───────────────────────────────────────────────────
+
+async def get_rtmp_creds(chat_id: int):
+    """Return cached RTMP creds dict {url, key} or None."""
+    return rtmp_creds_cache.get(chat_id)
+
+
+async def set_rtmp_creds(chat_id: int, url: str, key: str):
+    """Cache RTMP creds in memory and persist to MongoDB."""
+    rtmp_creds_cache[chat_id] = {"url": url, "key": key}
+    await rtmpdb.update_one(
+        {"chat_id": chat_id},
+        {"$set": {"url": url, "key": key}},
+        upsert=True,
+    )
+
+
+async def del_rtmp_creds(chat_id: int):
+    """Remove cached RTMP creds."""
+    rtmp_creds_cache.pop(chat_id, None)
+    await rtmpdb.delete_one({"chat_id": chat_id})
+
+
+async def load_rtmp_creds(chat_id: int):
+    """Load RTMP creds from MongoDB into cache (called lazily)."""
+    doc = await rtmpdb.find_one({"chat_id": chat_id})
+    if doc:
+        rtmp_creds_cache[chat_id] = {"url": doc["url"], "key": doc["key"]}
+        return rtmp_creds_cache[chat_id]
+    return None

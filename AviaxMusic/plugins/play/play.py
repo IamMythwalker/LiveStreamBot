@@ -3,7 +3,6 @@ import string
 
 from pyrogram import filters
 from pyrogram.types import InlineKeyboardMarkup, InputMediaPhoto, Message
-from pytgcalls.exceptions import NoActiveGroupCall
 
 import config
 from AviaxMusic import Apple, Resso, SoundCloud, Spotify, Telegram, YouTube, app
@@ -280,7 +279,7 @@ async def play_commnd(
         else:
             try:
                 await Aviax.stream_call(url)
-            except NoActiveGroupCall:
+            except Exception:
                 await mystic.edit_text(_["black_9"])
                 return await app.send_message(
                     chat_id=config.LOG_GROUP_ID,
