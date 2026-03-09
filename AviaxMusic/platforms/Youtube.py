@@ -22,6 +22,8 @@ from config import API_URL, VIDEO_API_URL, API_KEY
 YOUR_API_URL = None
 FALLBACK_API_URL = "https://shrutibots.site"
 
+_log = LOGGER(__name__)
+
 async def load_api_url():
     global YOUR_API_URL
     logger = LOGGER("AviaxMusic.platforms.Youtube")
@@ -67,7 +69,13 @@ async def download_song(link: str) -> str:
     file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
 
     if os.path.exists(file_path):
-        return file_path
+        if os.path.getsize(file_path) > 0:
+            return file_path
+        # Zero-size file from a previous failed download – remove and retry
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -97,10 +105,25 @@ async def download_song(link: str) -> str:
                     if file_response.status != 200:
                         return None
                         
-                    with open(file_path, "wb") as f:
-                        async for chunk in file_response.content.iter_chunked(16384):
-                            f.write(chunk)
-                    
+                    try:
+                        with open(file_path, "wb") as f:
+                            async for chunk in file_response.content.iter_chunked(16384):
+                                f.write(chunk)
+                    except Exception as write_err:
+                        _log.warning("[DOWNLOAD] Failed to write audio file %s: %s", file_path, write_err)
+                        try:
+                            os.remove(file_path)
+                        except OSError:
+                            pass
+                        return None
+
+                    if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+                        try:
+                            os.remove(file_path)
+                        except OSError:
+                            pass
+                        return None
+
                     return file_path
 
     except Exception:
@@ -124,7 +147,13 @@ async def download_video(link: str) -> str:
     file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp4")
 
     if os.path.exists(file_path):
-        return file_path
+        if os.path.getsize(file_path) > 0:
+            return file_path
+        # Zero-size file from a previous failed download – remove and retry
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -154,10 +183,25 @@ async def download_video(link: str) -> str:
                     if file_response.status != 200:
                         return None
                         
-                    with open(file_path, "wb") as f:
-                        async for chunk in file_response.content.iter_chunked(16384):
-                            f.write(chunk)
-                    
+                    try:
+                        with open(file_path, "wb") as f:
+                            async for chunk in file_response.content.iter_chunked(16384):
+                                f.write(chunk)
+                    except Exception as write_err:
+                        _log.warning("[DOWNLOAD] Failed to write video file %s: %s", file_path, write_err)
+                        try:
+                            os.remove(file_path)
+                        except OSError:
+                            pass
+                        return None
+
+                    if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+                        try:
+                            os.remove(file_path)
+                        except OSError:
+                            pass
+                        return None
+
                     return file_path
 
     except Exception:

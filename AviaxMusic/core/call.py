@@ -551,9 +551,13 @@ class Call:
         permissions in the given chat.  Failures are logged but not raised since
         the bot may already have insufficient rights to promote others."""
         try:
+            assistant_id = client.me.id if client.me else None
+            if not assistant_id:
+                _log.warning("[PROMOTE] Could not determine assistant user id for chat %s", chat_id)
+                return
             await app.promote_chat_member(
                 chat_id,
-                client.id,
+                assistant_id,
                 privileges=ChatPrivileges(
                     can_manage_chat=True,
                     can_manage_video_chats=True,
@@ -562,12 +566,13 @@ class Call:
             )
             _log.info(
                 "[PROMOTE] Promoted assistant %s as admin in chat %s",
-                client.id, chat_id,
+                assistant_id, chat_id,
             )
         except Exception as e:
+            assistant_id = client.me.id if client.me else "unknown"
             _log.warning(
                 "[PROMOTE] Could not promote assistant %s in chat %s: %s",
-                client.id, chat_id, e,
+                assistant_id, chat_id, e,
             )
 
     async def join_call(
@@ -736,6 +741,32 @@ class Call:
                 db[chat_id][0]["markup"] = "tg"
 
             else:
+                # If the local file no longer exists (e.g. cleaned up) and this
+                # is a YouTube video (not telegram/soundcloud), re-download it.
+                if not os.path.isfile(queued) and videoid not in ("telegram", "soundcloud"):
+                    mystic = await app.send_message(original_chat_id, _["call_7"])
+                    try:
+                        file_path, direct = await YouTube.download(
+                            videoid,
+                            mystic,
+                            videoid=True,
+                            video=video,
+                        )
+                        if not file_path:
+                            return await mystic.edit_text(
+                                _["call_6"], disable_web_page_preview=True
+                            )
+                        db[chat_id][0]["file"] = file_path
+                        queued = file_path
+                    except Exception as redownload_err:
+                        _log.warning(
+                            "[CHANGE_STREAM] Re-download failed for video %s in chat %s: %s",
+                            videoid, chat_id, redownload_err,
+                        )
+                        return await app.send_message(
+                            original_chat_id, text=_["call_6"]
+                        )
+                    await mystic.delete()
                 cmd = self._build_ffmpeg_cmd(queued, rtmp_url, rtmp_key, video=video)
                 try:
                     await self._start_ffmpeg(chat_id, cmd)
