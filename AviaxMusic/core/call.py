@@ -4,7 +4,7 @@ import random
 import signal
 import time
 from datetime import datetime, timedelta
-from typing import Union
+from typing import Optional, Union
 
 from pyrogram import Client
 from pyrogram.raw import functions
@@ -50,8 +50,38 @@ _paused_pos: dict = {}
 # Explicit stop flag to prevent _monitor_stream from restarting after /stop or /end
 _stopped: set = set()
 
+# Strong references to fire-and-forget tasks so they are not garbage-collected
+# before they finish, which would cause "Task exception was never retrieved".
+_background_tasks: set = set()
+
 autoend = {}
 counter = {}
+
+
+def _on_task_done(task: asyncio.Task) -> None:
+    """Done-callback: log any exception that escaped a background task."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        _log.error(
+            "[TASK] Unhandled exception in background task %r: %s",
+            task.get_name(), exc, exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
+
+def _create_background_task(coro, *, name: Optional[str] = None) -> asyncio.Task:
+    """Schedule *coro* as a fire-and-forget background task.
+
+    Keeps a strong reference in *_background_tasks* so the task is not
+    garbage-collected before it finishes, and logs any unhandled exception
+    that escapes the coroutine via :func:`_on_task_done`.
+    """
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    task.add_done_callback(_on_task_done)
+    return task
 
 
 async def _clear_(chat_id):
@@ -265,8 +295,8 @@ class Call:
         _active_procs[chat_id] = proc
         _stream_start[chat_id] = time.monotonic()
 
-        asyncio.create_task(self._monitor_stream(chat_id, proc))
-        asyncio.create_task(self._log_ffmpeg_stderr(chat_id, proc))
+        _create_background_task(self._monitor_stream(chat_id, proc), name=f"monitor-{chat_id}")
+        _create_background_task(self._log_ffmpeg_stderr(chat_id, proc), name=f"stderr-{chat_id}")
         return proc
 
     async def _log_ffmpeg_stderr(self, chat_id: int, proc):
@@ -296,16 +326,20 @@ class Call:
         except Exception:
             pass
 
-        # Only trigger auto-advance if this proc is still the registered one
-        # AND the chat hasn't been explicitly stopped
-        if _active_procs.get(chat_id) is proc and chat_id not in _stopped:
-            _active_procs.pop(chat_id, None)
-            _stream_start.pop(chat_id, None)
-            _log.debug("[MONITOR] Stream ended normally for chat_id=%s – advancing queue", chat_id)
-            await self.change_stream(None, chat_id)
-        else:
-            _log.debug("[MONITOR] Stream ended for chat_id=%s – no queue advance (stopped or replaced)", chat_id)
-        _stopped.discard(chat_id)
+        try:
+            # Only trigger auto-advance if this proc is still the registered one
+            # AND the chat hasn't been explicitly stopped
+            if _active_procs.get(chat_id) is proc and chat_id not in _stopped:
+                _active_procs.pop(chat_id, None)
+                _stream_start.pop(chat_id, None)
+                _log.debug("[MONITOR] Stream ended normally for chat_id=%s – advancing queue", chat_id)
+                await self.change_stream(None, chat_id)
+            else:
+                _log.debug("[MONITOR] Stream ended for chat_id=%s – no queue advance (stopped or replaced)", chat_id)
+        except Exception as e:
+            _log.error("[MONITOR] Error advancing queue for chat_id=%s: %s", chat_id, e)
+        finally:
+            _stopped.discard(chat_id)
 
     def _get_elapsed_seconds(self, chat_id: int) -> float:
         """Return seconds elapsed since the current FFmpeg process started."""
@@ -557,7 +591,7 @@ class Call:
         # Promote the assistant so it can manage the live stream
         try:
             assistant_client = await group_assistant(self, chat_id)
-            asyncio.create_task(self._try_promote_assistant(chat_id, assistant_client))
+            _create_background_task(self._try_promote_assistant(chat_id, assistant_client), name=f"promote-{chat_id}")
         except Exception as e:
             _log.warning("[JOIN] Could not get assistant for promotion in chat %s: %s", chat_id, e)
 
