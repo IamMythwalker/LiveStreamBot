@@ -1,6 +1,7 @@
 # ATLEAST GIVE CREDITS IF YOU STEALING :(((((((((((((((((((((((((((((((((((((
 # ELSE NO FURTHER PUBLIC THUMBNAIL UPDATES
 
+import asyncio
 import random
 import logging
 import os
@@ -10,37 +11,40 @@ import aiohttp
 import traceback
 import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
+from pyrogram.types import InputMediaPhoto
 from youtubesearchpython.__future__ import VideosSearch
+from AviaxMusic.utils.formatters import seconds_to_min
 
-logging.basicConfig(level=logging.INFO)
+# Use the central logger; do NOT call basicConfig here (logging.py owns that)
+_log = logging.getLogger(__name__)
 
-CACHE_DIR = "cache" 
-os.makedirs(CACHE_DIR, exist_ok=True) 
+CACHE_DIR = "cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 # Default fallback thumbnail URL if none provided
 DEFAULT_THUMB = "http://telegraph.controller.bot/files/7994865408/AgACAgUAAxkBAAID52mmsJp71qEEpXWN4um1zY6yUqSJAAJiD2sbNFkxVdj348mCgd56AQADAgADeAADOgQ"  # Replace with your actual fallback URL
 
-# Canvas and Card Settings 
-WIDTH, HEIGHT = 1280, 720 
-CARD_W, CARD_H = 1000, 580 
-CARD_X = (WIDTH - CARD_W) // 2 
-CARD_Y = (HEIGHT - CARD_H) // 2 
- 
-THUMB_W, THUMB_H = 960, 400 
-THUMB_X = CARD_X + (CARD_W - THUMB_W) // 2 
-THUMB_Y = CARD_Y + 20 
- 
+# Canvas and Card Settings
+WIDTH, HEIGHT = 1280, 720
+CARD_W, CARD_H = 1000, 580
+CARD_X = (WIDTH - CARD_W) // 2
+CARD_Y = (HEIGHT - CARD_H) // 2
+
+THUMB_W, THUMB_H = 960, 400
+THUMB_X = CARD_X + (CARD_W - THUMB_W) // 2
+THUMB_Y = CARD_Y + 20
+
 # Adjusted positions to fit within card boundaries
-TITLE_Y = THUMB_Y + THUMB_H + 20 
-META_Y = TITLE_Y + 36 
-BAR_Y = META_Y + 45 
-BAR_W = 800 
+TITLE_Y = THUMB_Y + THUMB_H + 20
+META_Y = TITLE_Y + 36
+BAR_Y = META_Y + 45
+BAR_W = 800
 BAR_H = 8  # Bold progress bar
 BAR_X = CARD_X + (CARD_W - BAR_W) // 2  # Centered within card
- 
-MAX_TITLE_WIDTH = 940 
- 
- 
+
+MAX_TITLE_WIDTH = 940
+
+
 def trim_to_width(text: str, font: ImageFont.FreeTypeFont, max_w: int) -> str: 
     ellipsis = "…" 
     if font.getlength(text) <= max_w: 
@@ -145,104 +149,231 @@ def draw_text_with_shadow(background, draw, position, text, font, fill, shadow_o
     
     draw.text(position, text, font=font, fill=fill)
 
+def _draw_card(base, draw, thumb, title, views, duration_text, is_live,
+               title_font, regular_font, time_font, progress: float = 0.0,
+               elapsed_text: str = "00:00"):
+    """Draw the frosted card, thumbnail, title, metadata, and progress bar.
+
+    Args:
+        progress: float between 0.0 and 1.0 representing playback progress.
+        elapsed_text: human-readable elapsed time string (e.g. "01:23").
+    """
+    # White frosted card with rounded corners
+    card = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
+    card_draw = ImageDraw.Draw(card)
+    card_draw.rounded_rectangle([(0, 0), (CARD_W, CARD_H)], radius=30, fill=(255, 255, 255, 180))
+    frosted = card.filter(ImageFilter.GaussianBlur(5))
+    base.paste(frosted, (CARD_X, CARD_Y), frosted)
+
+    # Resize and paste thumbnail with rounded corners (album art style)
+    thumb_r = thumb.resize((THUMB_W, THUMB_H), Image.Resampling.LANCZOS)
+    thumb_rounded = Image.new("RGBA", (THUMB_W, THUMB_H), (0, 0, 0, 0))
+    thumb_draw_r = ImageDraw.Draw(thumb_rounded)
+    thumb_draw_r.rounded_rectangle([(0, 0), (THUMB_W, THUMB_H)], radius=20, fill=(255, 255, 255, 255))
+    thumb_mask = thumb_rounded.convert("L")
+    thumb_r.putalpha(thumb_mask)
+    base.paste(thumb_r, (THUMB_X, THUMB_Y), thumb_r)
+
+    # Title
+    title_text = trim_to_width(title, title_font, MAX_TITLE_WIDTH)
+    draw.text((CARD_X + CARD_W // 2, TITLE_Y), title_text, fill="black", font=title_font, anchor="mm")
+
+    # Metadata
+    platform = "🔴 LIVE" if is_live else "YouTube"
+    draw.text((CARD_X + CARD_W // 2, META_Y), f"{platform} | {views}", fill="black", font=regular_font, anchor="mm")
+
+    # Progress bar  
+    progress = max(0.0, min(1.0, progress))
+    bar_green_len = int(BAR_W * progress)
+
+    # Track background
+    draw.rounded_rectangle(
+        [(BAR_X, BAR_Y - BAR_H // 2), (BAR_X + BAR_W, BAR_Y + BAR_H // 2)],
+        radius=BAR_H // 2, fill=(200, 200, 200, 220)
+    )
+    # Filled portion
+    if bar_green_len > 0:
+        draw.rounded_rectangle(
+            [(BAR_X, BAR_Y - BAR_H // 2), (BAR_X + bar_green_len, BAR_Y + BAR_H // 2)],
+            radius=BAR_H // 2, fill=(30, 215, 96, 255)  # Spotify-green
+        )
+    # Scrubber dot
+    dot_x = BAR_X + bar_green_len
+    draw.ellipse([(dot_x - 9, BAR_Y - 9), (dot_x + 9, BAR_Y + 9)], fill=(30, 215, 96, 255))
+
+    # Time labels
+    draw.text((BAR_X, BAR_Y + 14), elapsed_text, fill="#555555", font=time_font)
+    draw.text(
+        (BAR_X + BAR_W, BAR_Y + 14),
+        "🔴 LIVE" if is_live else duration_text,
+        fill="#cc0000" if is_live else "#555555",
+        font=time_font,
+        anchor="ra",
+    )
+
+
 async def gen_thumb(videoid: str) -> str:
+    """Generate a cached thumbnail at progress=0 (or cached version)."""
+    return await gen_thumb_with_progress(videoid, progress=0.0, elapsed_text="00:00")
+
+
+async def gen_thumb_with_progress(
+    videoid: str,
+    progress: float = 0.0,
+    elapsed_text: str = "00:00",
+    force: bool = False,
+) -> str:
+    """Generate (or re-generate) a thumbnail image for *videoid*.
+
+    Args:
+        videoid: YouTube video ID.
+        progress: Playback progress ratio in [0.0, 1.0].
+        elapsed_text: Human-readable elapsed time, e.g. "02:45".
+        force: When True, ignore any cached file and re-render.
+
+    Returns:
+        Path to the generated PNG, or None on failure.
+    """
     try:
-        cache_path = os.path.join(CACHE_DIR, f"{videoid}_v4.png") 
-        if os.path.exists(cache_path): 
-            return cache_path 
+        # For static (initial) thumbnails we cache at progress=0.
+        # Dynamic progress thumbnails use a separate filename so the static
+        # cache is never invalidated.
+        if force or progress > 0.0:
+            cache_path = os.path.join(CACHE_DIR, f"{videoid}_prog.png")
+        else:
+            cache_path = os.path.join(CACHE_DIR, f"{videoid}_v4.png")
+            if os.path.exists(cache_path):
+                return cache_path
 
-        # Use the already imported VideosSearch
-        results = VideosSearch(f"https://www.youtube.com/watch?v={videoid}", limit=1) 
-        try: 
-            results_data = await results.next() 
-            data = results_data.get("result", [])[0] 
-            title = re.sub(r"\W+", " ", data.get("title", "Unsupported Title")).title() 
-            thumbnail = data.get("thumbnails", [{}])[0].get("url", DEFAULT_THUMB) 
-            duration = data.get("duration") 
-            views = data.get("viewCount", {}).get("short", "Unknown Views") 
+        # ── Fetch video metadata ───────────────────────────────────────────
+        results = VideosSearch(f"https://www.youtube.com/watch?v={videoid}", limit=1)
+        try:
+            results_data = await results.next()
+            data = results_data.get("result", [])[0]
+            title = re.sub(r"\W+", " ", data.get("title", "Unsupported Title")).title()
+            thumbnail = data.get("thumbnails", [{}])[0].get("url", DEFAULT_THUMB)
+            duration = data.get("duration")
+            views = data.get("viewCount", {}).get("short", "Unknown Views")
         except Exception as e:
-            logging.error(f"Error fetching video data: {e}")
-            title, thumbnail, duration, views = "Unsupported Title", DEFAULT_THUMB, None, "Unknown Views" 
+            _log.error("Error fetching video data for %s: %s", videoid, e)
+            title, thumbnail, duration, views = "Unsupported Title", DEFAULT_THUMB, None, "Unknown Views"
 
-        is_live = not duration or str(duration).strip().lower() in {"", "live", "live now"} 
-        duration_text = "Live" if is_live else duration or "Unknown Mins" 
+        is_live = not duration or str(duration).strip().lower() in {"", "live", "live now"}
+        duration_text = "LIVE" if is_live else (duration or "--:--")
 
-        thumb_path = os.path.join(CACHE_DIR, f"thumb{videoid}.png") 
-        try: 
-            async with aiohttp.ClientSession() as session: 
-                async with session.get(thumbnail) as resp: 
-                    if resp.status == 200: 
-                        async with aiofiles.open(thumb_path, "wb") as f: 
-                            await f.write(await resp.read()) 
-                    else:
-                        # Create a blank image if thumbnail download fails
-                        thumb = Image.new('RGB', (THUMB_W, THUMB_H), color='gray')
-                        thumb.save(thumb_path)
+        # ── Download YouTube thumbnail ─────────────────────────────────────
+        thumb_path = os.path.join(CACHE_DIR, f"thumb{videoid}.png")
+        thumb_downloaded = False
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(thumbnail, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        async with aiofiles.open(thumb_path, "wb") as f:
+                            await f.write(await resp.read())
+                        thumb_downloaded = True
         except Exception as e:
-            logging.error(f"Error downloading thumbnail: {e}")
-            # Create a blank image if thumbnail download fails
-            thumb = Image.new('RGB', (THUMB_W, THUMB_H), color='gray')
-            thumb.save(thumb_path)
+            _log.warning("Thumbnail download failed for %s: %s", videoid, e)
 
-        # Load and blur background 
-        thumb = Image.open(thumb_path).convert("RGB") 
-        bg = thumb.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS).filter(ImageFilter.GaussianBlur(30)) 
-        base = bg.convert("RGBA") 
+        if not thumb_downloaded:
+            thumb_img = Image.new("RGB", (THUMB_W, THUMB_H), color=(40, 40, 40))
+            thumb_img.save(thumb_path)
 
-        draw = ImageDraw.Draw(base) 
+        # ── Build the card ─────────────────────────────────────────────────
+        thumb_img = Image.open(thumb_path).convert("RGB")
 
-        # White frosted card with rounded corners
-        card = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0)) 
-        card_draw = ImageDraw.Draw(card)
-        # Draw rounded rectangle
-        card_draw.rounded_rectangle([(0, 0), (CARD_W, CARD_H)], radius=30, fill=(255, 255, 255, 180))
-        frosted = card.filter(ImageFilter.GaussianBlur(5)) 
-        base.paste(frosted, (CARD_X, CARD_Y), frosted) 
+        # Blurred background
+        bg = thumb_img.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS).filter(ImageFilter.GaussianBlur(30))
+        base = bg.convert("RGBA")
+        draw = ImageDraw.Draw(base)
 
-        # Load fonts 
-        try: 
-            title_font = ImageFont.truetype("AviaxMusic/assets/font2.ttf", 36) 
-            regular_font = ImageFont.truetype("AviaxMusic/assets/font.ttf", 22) 
-            time_font = ImageFont.truetype("AviaxMusic/assets/font.ttf", 20) 
-        except OSError: 
-            title_font = regular_font = time_font = ImageFont.load_default() 
+        # Fonts
+        try:
+            title_font = ImageFont.truetype("AviaxMusic/assets/font2.ttf", 36)
+            regular_font = ImageFont.truetype("AviaxMusic/assets/font.ttf", 22)
+            time_font = ImageFont.truetype("AviaxMusic/assets/font.ttf", 20)
+        except OSError:
+            _log.warning("Custom fonts not found – falling back to default")
+            title_font = regular_font = time_font = ImageFont.load_default()
 
-        # Resize and paste thumbnail with rounded corners (album art style)
-        thumb = thumb.resize((THUMB_W, THUMB_H), Image.Resampling.LANCZOS)
-        # Create rounded thumbnail
-        thumb_rounded = Image.new("RGBA", (THUMB_W, THUMB_H), (0, 0, 0, 0))
-        thumb_draw = ImageDraw.Draw(thumb_rounded)
-        thumb_draw.rounded_rectangle([(0, 0), (THUMB_W, THUMB_H)], radius=20, fill=(255, 255, 255, 255))
-        thumb_mask = thumb_rounded.convert("L")
-        thumb.putalpha(thumb_mask)
-        base.paste(thumb, (THUMB_X, THUMB_Y), thumb) 
+        _draw_card(
+            base, draw, thumb_img,
+            title, views, duration_text, is_live,
+            title_font, regular_font, time_font,
+            progress=progress,
+            elapsed_text=elapsed_text,
+        )
 
-        # Title - centered within card width
-        title_text = trim_to_width(title, title_font, MAX_TITLE_WIDTH) 
-        draw.text((CARD_X + CARD_W // 2, TITLE_Y), title_text, fill="black", font=title_font, anchor="mm") 
+        # ── Cleanup & save ─────────────────────────────────────────────────
+        try:
+            os.remove(thumb_path)
+        except OSError:
+            pass
 
-        # Metadata - centered within card width
-        draw.text((CARD_X + CARD_W // 2, META_Y), f"YouTube | {views}", fill="black", font=regular_font, anchor="mm") 
-
-        # Bold green progress bar 
-        bar_green_len = int(BAR_W * 0.3) 
-        draw.line([(BAR_X, BAR_Y), (BAR_X + bar_green_len, BAR_Y)], fill="green", width=BAR_H) 
-        draw.line([(BAR_X + bar_green_len, BAR_Y), (BAR_X + BAR_W, BAR_Y)], fill="gray", width=BAR_H) 
-        draw.ellipse([(BAR_X + bar_green_len - 8, BAR_Y - 8), (BAR_X + bar_green_len + 8, BAR_Y + 8)], fill="green") 
-
-        draw.text((BAR_X, BAR_Y + 15), "00:00", fill="black", font=time_font) 
-        draw.text((BAR_X + BAR_W - 60, BAR_Y + 15), 
-                  "Live" if is_live else duration_text, fill="red" if is_live else "black", font=time_font) 
-
-        try: 
-            os.remove(thumb_path) 
-        except OSError: 
-            pass 
-
-        base.save(cache_path, "PNG", optimize=False) 
+        base.save(cache_path, "PNG", optimize=False)
+        _log.debug("Thumbnail generated: %s (progress=%.2f)", cache_path, progress)
         return cache_path
-        
+
     except Exception as e:
-        logging.error(f"Error generating thumbnail for video {videoid}: {e}")
+        _log.error("Error generating thumbnail for %s: %s", videoid, e)
         traceback.print_exc()
         return None
+
+
+async def schedule_thumb_updates(
+    chat_id: int,
+    videoid: str,
+    total_seconds: int,
+    mystic,           # pyrogram Message object with the stream card
+    markup,           # InlineKeyboardMarkup
+    caption_fn,       # callable(elapsed_text, duration_text) -> str
+    interval: int = 30,
+):
+    """Background task: refresh the stream card thumbnail every *interval* seconds.
+
+    This gives viewers a live progress bar that moves as the track plays.
+    The task is automatically cancelled when the stream ends (mystic is deleted)
+    or when the total duration is reached.
+
+    Args:
+        chat_id: Telegram chat ID (used for logging only).
+        videoid: YouTube video ID for thumbnail generation.
+        total_seconds: Total track duration in seconds.
+        mystic: The Pyrogram Message object to edit.
+        markup: InlineKeyboardMarkup to keep on the edited message.
+        caption_fn: Callable that returns the new caption given (elapsed, total).
+        interval: How often (seconds) to update the thumbnail.
+    """
+    # Deferred import to avoid circular dependency at module load time
+    from AviaxMusic import app  # noqa: F401 – used implicitly via mystic
+
+    elapsed = 0
+    while elapsed < total_seconds:
+        await asyncio.sleep(interval)
+        elapsed += interval
+        if elapsed > total_seconds:
+            elapsed = total_seconds
+
+        progress = elapsed / total_seconds if total_seconds > 0 else 0.0
+        elapsed_text = seconds_to_min(elapsed)
+
+        try:
+            new_thumb = await gen_thumb_with_progress(
+                videoid, progress=progress, elapsed_text=elapsed_text, force=True
+            )
+            if new_thumb is None:
+                continue
+
+            caption = caption_fn(elapsed_text, seconds_to_min(total_seconds))
+
+            await mystic.edit_media(
+                InputMediaPhoto(media=new_thumb, caption=caption),
+                reply_markup=markup,
+            )
+            _log.debug(
+                "[THUMB_UPDATE] chat=%s vidid=%s progress=%.0f%%",
+                chat_id, videoid, progress * 100,
+            )
+        except Exception as e:
+            _log.warning("[THUMB_UPDATE] Failed for chat=%s: %s", chat_id, e)
+            break  # Stop updates if editing fails (message deleted, etc.)
+

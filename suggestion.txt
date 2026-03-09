@@ -1,0 +1,322 @@
+LiveStreamBot – Feature Suggestions
+====================================
+Below are 50 detailed improvement ideas with the functions / areas they would
+touch.  Suggestions are grouped by theme.  Microphone support ideas are
+included at the end (marked [MIC]) but are NOT implemented here.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RTMP / STREAMING ENGINE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1.  Adaptive Bitrate (ABR) streaming
+    Function: Call._build_ffmpeg_cmd()
+    Detect the available upload bandwidth via a quick speedtest before choosing
+    the video bitrate.  If bandwidth < 2 Mbps, fall back to 720p / 1.5 Mbps;
+    below 1 Mbps, fall back to audio-only.
+
+2.  Hardware-accelerated encoding (NVENC / VAAPI / VideoToolbox)
+    Function: Call._build_ffmpeg_cmd()
+    Check for GPU availability at startup (ffmpeg -encoders) and swap
+    libx264 → h264_nvenc (NVIDIA) or h264_vaapi (Intel/AMD) to slash CPU use.
+
+3.  Reconnect-on-drop RTMP flag
+    Function: Call._build_ffmpeg_cmd()
+    Add -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 5
+    so FFmpeg automatically retries if the RTMP connection drops.
+
+4.  GOP size tuned to frame-rate
+    Function: Call._build_ffmpeg_cmd()
+    Compute keyframe interval as 2 × FPS (e.g. -g 60 for 30 fps) instead of a
+    fixed -g 50 to minimise seek delays for viewers.
+
+5.  Low-latency HLS fallback output
+    Function: new Call.start_hls_stream()
+    Pipe a second FFmpeg process to an HLS playlist served by the bundled Flask
+    server, so users without Telegram can watch via a web browser.
+
+6.  Stream health watchdog
+    Function: Call._monitor_stream() extension
+    Parse FFmpeg's progress output (via -progress pipe:) to detect if the
+    bitrate drops to zero for >10 s and automatically restart the stream.
+
+7.  RTMP credential rotation
+    Function: Call._get_or_create_rtmp_creds()
+    Expose a /rotatekey command that calls GetGroupCallStreamRtmpUrl(revoke=True)
+    to invalidate a potentially leaked stream key.
+
+8.  Multiple simultaneous quality profiles
+    Function: Call._build_ffmpeg_cmd() + new Call.join_call_multistream()
+    Use FFmpeg's -filter_complex to encode 1080p + 720p + audio-only in a single
+    pass and push to separate RTMP keys (requires multi-stream Telegram support).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PLAYBACK UX
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+9.  Real-time position tracking via FFmpeg progress pipe
+    Function: new Call._track_position()
+    Read FFmpeg's -progress fd output in a background coroutine and update
+    db[chat_id][0]["played"] every second for accurate seek/display.
+
+10. Chapter markers on the progress bar thumbnail
+    Function: gen_thumb_with_progress() + schedule_thumb_updates()
+    Fetch YouTube chapter data (via yt-dlp --dump-json) and draw tick marks on
+    the progress bar at each chapter boundary.
+
+11. Waveform visualisation thumbnail
+    Function: gen_thumb_with_progress()
+    Generate an audio waveform image (using numpy/matplotlib from the first
+    30 s of audio) and overlay it below the thumbnail card.
+
+12. Dark-mode thumbnail variant
+    Function: gen_thumb_with_progress()
+    Detect Telegram's client theme preference (not publicly available) or add
+    a /darkthumb toggle command that swaps the white frosted card for a dark
+    glass-morphism card.
+
+13. Equaliser preset selection
+    Function: Call._build_ffmpeg_cmd() + new /eq command
+    Allow admins to pick an EQ preset (bass-boost, vocal-boost, flat) that
+    adds an -af equalizer= filter chain to the FFmpeg command.
+
+14. Crossfade between tracks
+    Function: Call.change_stream()
+    When advancing to the next track, spawn an overlapping FFmpeg process that
+    fades in the new track while the old one fades out over 3 s.
+
+15. Volume normalisation (loudnorm)
+    Function: Call._build_ffmpeg_cmd()
+    Add -af loudnorm=I=-16:LRA=11:TP=-1.5 so every track plays at a consistent
+    perceived loudness regardless of source level.
+
+16. Skip countdown OSD
+    Function: new skip_countdown_overlay()
+    Display a countdown timer in the corner of the video for the last 10 s of a
+    track using the -vf drawtext FFmpeg filter.
+
+17. Gapless playback
+    Function: Call.change_stream()
+    Pre-download the next track in the queue while the current one is still
+    playing, then switch without killing and restarting the FFmpeg process.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUEUE / PLAYLIST
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+18. Persistent queue (MongoDB)
+    Function: put_queue() + new load_queue_from_db()
+    Serialise the queue to MongoDB so it survives bot restarts.
+
+19. DJ mode (users vote on next track)
+    Function: new /vote_next command + callback handler
+    Display the top-3 queued tracks as poll options; the one with the most
+    reactions plays next when the current track ends.
+
+20. Smart auto-queue (related tracks)
+    Function: Call.change_stream()
+    When the queue is empty, use yt-dlp's related-videos endpoint to
+    automatically enqueue a related track instead of stopping.
+
+21. Queue import from Telegram playlist file
+    Function: new /importqueue command
+    Accept a .m3u / .txt file with one YouTube URL per line and add them all
+    to the queue.
+
+22. Per-user queue limit with bypass for admins
+    Function: put_queue()
+    Track how many tracks each user has queued and reject additions over a
+    configurable per-user cap (default 3), bypassed for admins.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+THUMBNAIL / UI
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+23. Animated GIF thumbnail for first few seconds
+    Function: gen_thumb_with_progress()
+    Extract a 3 s GIF preview from the video using FFmpeg and send it as the
+    stream card image so the chat card animates.
+
+24. Custom per-group thumbnail backgrounds
+    Function: gen_thumb_with_progress() + new /setbg command
+    Allow group admins to upload a custom background image stored in GridFS /
+    Telegram's cloud; it replaces the blurred-thumbnail background.
+
+25. Lyrics overlay on thumbnail
+    Function: gen_thumb_with_progress()
+    Fetch the current lyric line from a /lyric API and draw it in italics at
+    the bottom of the thumbnail card.
+
+26. Album art circle (avatar style) for non-YouTube tracks
+    Function: gen_thumb_with_progress()
+    Draw the track's album art as a circle in the top-left corner of the card
+    (like streaming apps) when an album art URL is available.
+
+27. Inline stream card with live viewer count badge
+    Function: new update_viewer_badge()
+    Periodically call Telegram's GetGroupCallParticipants to fetch the current
+    viewer count and redraw a badge on the thumbnail.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ADMIN / MODERATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+28. Song request approval workflow
+    Function: new /approve and /reject commands
+    When /playmode is set to "approval", queued tracks are held pending admin
+    approval; admins see a notification with [Approve] / [Reject] buttons.
+
+29. Blocklist keywords / artists
+    Function: put_queue() + new /blockword command
+    Reject tracks whose title matches a per-group blocklist (stored in MongoDB)
+    with a user-friendly error message.
+
+30. Admin-only fast-seek panel
+    Function: new /seekpanel command
+    Send an interactive inline keyboard with 10 s, 30 s, 1 min, 5 min seek
+    buttons instead of requiring the admin to type exact seconds.
+
+31. Anti-spam cooldown per user
+    Function: PlayWrapper()
+    Rate-limit non-admin play requests to once per N seconds (configurable via
+    /cooldown <seconds>) to prevent queue flooding.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PLATFORMS / SOURCES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+32. Deezer integration
+    Function: new AviaxMusic/platforms/deezer.py
+    Use the public Deezer API (no key needed for 30 s previews) to resolve
+    track URLs and fall back to YouTube for full playback.
+
+33. Local file server (LAN streaming)
+    Function: new /localplay command
+    Accept a path to a file on the server's filesystem, verify it's in an
+    allowed directory, and stream it directly without YouTube download.
+
+34. Podcast RSS feed support
+    Function: new AviaxMusic/platforms/podcast.py
+    Parse an RSS feed URL to extract audio enclosure links, add them to the
+    queue, and display episode art/description in the stream card.
+
+35. Radio station presets
+    Function: new /radio command + stations.json config
+    Bundle a JSON file of popular radio stream URLs; /radio list shows them as
+    an inline keyboard; /radio <name> plays the chosen station immediately.
+
+36. Bandcamp / SoundCloud full-track download
+    Function: AviaxMusic/platforms/soundcloud.py
+    Use yt-dlp to download SoundCloud full tracks (not just the 30 s preview)
+    when a valid cookie is supplied.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PERFORMANCE / RELIABILITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+37. Download cache with LRU eviction
+    Function: YouTube.download() + new LRUCache class
+    Keep downloaded files in a configurable-size cache directory; when the
+    limit is reached, delete the least-recently-used file.
+
+38. Parallel yt-dlp workers
+    Function: YouTube.download()
+    Use a semaphore-controlled asyncio pool (max 3 concurrent downloads) to
+    pre-fetch upcoming queue items while the current track is playing.
+
+39. Graceful shutdown handler
+    Function: Call.stop() / __main__.py
+    Catch SIGTERM / SIGINT, drain the queue state to MongoDB, terminate all
+    FFmpeg processes cleanly, then exit.
+
+40. Health-check HTTP endpoint
+    Function: new AviaxMusic/utils/health.py
+    Expose /health via the existing Flask server with JSON stats (active streams,
+    queue depths, memory usage) for external monitoring tools like UptimeRobot.
+
+41. Prometheus metrics exporter
+    Function: new AviaxMusic/utils/metrics.py
+    Expose Prometheus-format counters/gauges (streams_started_total,
+    ffmpeg_errors_total, queue_depth) on /metrics for Grafana dashboards.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LOGGING / DEBUGGING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+42. Structured JSON logging
+    Function: AviaxMusic/logging.py
+    Replace the plain-text formatter with a JSON formatter (via python-json-logger)
+    for ingestion into Elasticsearch / Loki.
+
+43. Per-chat log context
+    Function: every command handler
+    Use logging.LoggerAdapter with {"chat_id": ...} so every log line includes
+    the originating chat for easy grep/filtering.
+
+44. FFmpeg crash report to log group
+    Function: Call._monitor_stream()
+    When FFmpeg exits with a non-zero code, capture the last 20 lines of stderr
+    and forward them to config.LOG_GROUP_ID as a formatted message.
+
+45. Rotating log files
+    Function: AviaxMusic/logging.py
+    Replace FileHandler with RotatingFileHandler (maxBytes=10 MB, backupCount=5)
+    to prevent log.txt from growing indefinitely.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MULTI-ASSISTANT / SCALABILITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+46. Assistant load balancer
+    Function: group_assistant() in database.py
+    Assign assistants by current active-stream count rather than a fixed round-
+    robin to balance load across the 5 assistant slots.
+
+47. Assistant presence heartbeat
+    Function: AviaxMusic/core/userbot.py
+    Each assistant sends a heartbeat message to a private group every 5 min; if
+    a heartbeat is missed, mark the assistant as offline and reassign its chats.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+GENERAL / MISC
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+48. Per-group stream history (last 20 played)
+    Function: new /history command + historydb collection
+    Log every played track to MongoDB; /history shows the last 20 with [Play
+    Again] inline buttons.
+
+49. Lyrics command with synced timing
+    Function: new /lyrics command
+    Fetch synced LRC lyrics from lrclib.net / Musixmatch and post them line-by-
+    line via message edits in sync with the current playback position.
+
+50. Telegram Stars tipping / request fee
+    Function: PlayWrapper() + Telegram Payments API
+    Optionally require users to pay a small Telegram Stars fee to queue tracks
+    when the bot is in "premium" mode; collected stars are forwarded to the
+    group owner.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[MIC] MICROPHONE SUPPORT SUGGESTIONS (not implemented)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+MIC-1  Push-to-talk via FFmpeg alsa/pulse input
+       A /mic start command would add -f pulse -i default as a second input to
+       the FFmpeg command using amerge/amix to blend mic audio with the track.
+       Requires ALSA/PulseAudio on the server with a virtual mic device.
+
+MIC-2  Voice changer (pitch shift / robot)
+       Pipe the mic input through -af asetrate,aresample,atempo for pitch
+       shifting, or through a custom LADSPA plugin for a "robot" voice effect.
+
+MIC-3  Noise suppression for mic input
+       Apply -af arnndn=model=./rnnoise-model.rnnn (RNNoise) to the microphone
+       capture to suppress background noise before mixing into the stream.
+
+MIC-4  Mic mute/unmute inline button
+       Add [🎤 Mute Mic] / [🔈 Unmute Mic] buttons to the stream card that
+       toggle the mic mixer's volume via SIGSTOP/SIGCONT of the capture process.
+
+MIC-5  Separate DJ/host mic channel
+       Introduce a second assistant account dedicated to capturing the host's
+       microphone; its audio is mixed at higher priority into the RTMP stream.

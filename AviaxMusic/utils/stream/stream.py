@@ -1,3 +1,4 @@
+import asyncio
 import os
 from random import randint
 from typing import Union
@@ -10,10 +11,41 @@ from AviaxMusic.core.call import Aviax
 from AviaxMusic.misc import db
 from AviaxMusic.utils.database import add_active_video_chat, is_active_chat
 from AviaxMusic.utils.exceptions import AssistantErr
+from AviaxMusic.utils.formatters import time_to_seconds
 from AviaxMusic.utils.inline import aq_markup, close_markup, stream_markup
 from AviaxMusic.utils.pastebin import AviaxBin
 from AviaxMusic.utils.stream.queue import put_queue, put_queue_index
-from AviaxMusic.utils.thumbnails import gen_thumb
+from AviaxMusic.utils.thumbnails import gen_thumb, schedule_thumb_updates
+
+
+def _start_thumb_updater(chat_id, original_chat_id, vidid, duration_min, run, _, update_markup):
+    """Fire-and-forget task to update the stream card thumbnail with progress."""
+    try:
+        total_sec = time_to_seconds(duration_min) if duration_min and duration_min != "Live Track" else 0
+        if total_sec <= 0:
+            return  # Don't schedule for live streams or unknown durations
+
+        def caption_fn(elapsed_text, dur_text):
+            return _["stream_1"].format(
+                f"https://t.me/{app.username}?start=info_{vidid}",
+                run.caption.split("\n")[0] if run.caption else "",
+                dur_text,
+                "",
+            )
+
+        asyncio.create_task(
+            schedule_thumb_updates(
+                chat_id=original_chat_id,
+                videoid=vidid,
+                total_seconds=total_sec,
+                mystic=run,
+                markup=update_markup,
+                caption_fn=caption_fn,
+                interval=30,
+            )
+        )
+    except Exception:
+        pass
 
 
 async def stream(
@@ -113,6 +145,10 @@ async def stream(
                 )
                 db[chat_id][0]["mystic"] = run
                 db[chat_id][0]["markup"] = "stream"
+                _start_thumb_updater(
+                    chat_id, original_chat_id, vidid, duration_min,
+                    run, _, InlineKeyboardMarkup(button)
+                )
         if count == 0:
             return
         else:
@@ -207,6 +243,11 @@ async def stream(
             )
             db[chat_id][0]["mystic"] = run
             db[chat_id][0]["markup"] = "stream"
+            # Start live progress-bar thumbnail updates
+            _start_thumb_updater(
+                chat_id, original_chat_id, vidid, duration_min,
+                run, _, InlineKeyboardMarkup(button)
+            )
     elif streamtype == "soundcloud":
         file_path = result["filepath"]
         title = result["title"]

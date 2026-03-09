@@ -2,12 +2,13 @@ import asyncio
 import os
 import random
 import signal
+import time
 from datetime import datetime, timedelta
 from typing import Union
 
 from pyrogram import Client
 from pyrogram.raw import functions
-from pyrogram.types import InlineKeyboardMarkup
+from pyrogram.types import ChatPrivileges, InlineKeyboardMarkup
 
 import config
 from AviaxMusic import LOGGER, YouTube, app
@@ -35,8 +36,19 @@ from AviaxMusic.utils.stream.autoclear import auto_clean
 from AviaxMusic.utils.thumbnails import gen_thumb
 from strings import get_string
 
+_log = LOGGER(__name__)
+
 # In-memory FFmpeg process tracking: {chat_id: asyncio.subprocess.Process}
 _active_procs: dict = {}
+
+# Track stream start times for accurate position calculation: {chat_id: (start_time, offset_seconds)}
+_stream_start: dict = {}
+
+# Track paused positions: {chat_id: paused_seconds}
+_paused_pos: dict = {}
+
+# Explicit stop flag to prevent _monitor_stream from restarting after /stop or /end
+_stopped: set = set()
 
 autoend = {}
 counter = {}
@@ -101,18 +113,26 @@ class Call:
         self.five = self.userbot5
 
     async def _get_or_create_rtmp_creds(self, chat_id: int):
-        """Return (url, key) for the RTMP ingest endpoint of chat_id."""
+        """Return (url, key) for the RTMP ingest endpoint of chat_id.
+
+        Tries cached credentials first, then fetches/creates via Telegram.
+        Raises AssistantErr with a user-visible ``call_11`` message when the
+        live stream is not running and credentials cannot be obtained.
+        """
         creds = await get_rtmp_creds(chat_id)
         if not creds:
             creds = await load_rtmp_creds(chat_id)
         if creds:
+            _log.debug("[RTMP] Using cached credentials for chat_id=%s", chat_id)
             return creds["url"], creds["key"]
 
+        _log.info("[RTMP] No cached credentials for chat_id=%s – fetching via assistant", chat_id)
         client = await group_assistant(self, chat_id)
 
         try:
             peer = await client.resolve_peer(chat_id)
         except Exception as exc:
+            _log.error("[RTMP] Failed to resolve peer for chat_id=%s: %s", chat_id, exc)
             raise AssistantErr(f"Failed to resolve peer for chat {chat_id}: {exc}")
 
         try:
@@ -124,7 +144,9 @@ class Call:
             )
             url = result.url
             key = result.key
-        except Exception:
+            _log.info("[RTMP] Fetched existing RTMP credentials for chat_id=%s", chat_id)
+        except Exception as e1:
+            _log.warning("[RTMP] GetGroupCallStreamRtmpUrl failed for chat_id=%s: %s – trying CreateGroupCall", chat_id, e1)
             try:
                 await client.invoke(
                     functions.phone.CreateGroupCall(
@@ -142,7 +164,16 @@ class Call:
                 )
                 url = result.url
                 key = result.key
+                _log.info("[RTMP] Created new RTMP live stream for chat_id=%s", chat_id)
             except Exception as exc2:
+                _log.error("[RTMP] Could not create RTMP stream for chat_id=%s: %s", chat_id, exc2)
+                # Send a human-readable notification – translated via the chat's language
+                try:
+                    language = await get_lang(chat_id)
+                    _ = get_string(language)
+                    await app.send_message(chat_id, _["call_11"])
+                except Exception:
+                    pass
                 raise AssistantErr(f"Failed to get RTMP credentials: {exc2}")
 
         await set_rtmp_creds(chat_id, url, key)
@@ -157,9 +188,31 @@ class Call:
         ss=None,
         to=None,
     ):
-        """Return the FFmpeg argv list for an RTMP stream."""
+        """Return the FFmpeg argv list for an RTMP stream.
+
+        Low-latency tuning:
+        - probesize / analyzeduration cut down the input-analysis phase that
+          causes the initial buffer pause.
+        - thread_queue_size avoids packet-queue overflows on fast sources.
+        - fflags +genpts / flush_packets 1 ensure clean timestamps at every
+          restart (seek / resume) so viewers don't see buffering artefacts.
+        - tune zerolatency makes x264 emit frames immediately rather than
+          buffering a full GOP before flushing.
+        """
+        import logging as _logging  # noqa: PLC0415 – local to avoid shadowing module-level LOGGER
         full_url = f"{rtmp_url}{rtmp_key}"
-        cmd = ["ffmpeg", "-re", "-loglevel", "quiet"]
+
+        # Verbosity: quiet in production, verbose when debug logging is active
+        loglevel = "warning" if _logging.getLogger().isEnabledFor(_logging.DEBUG) else "quiet"
+
+        cmd = [
+            "ffmpeg",
+            "-re",                      # read input at native rate (crucial for RTMP)
+            "-fflags", "+genpts",        # regenerate PTS – avoids timestamp gaps on restart
+            "-probesize", "500000",      # 500 KB probe (default 5 MB) → faster open
+            "-analyzeduration", "500000", # 0.5 s analysis (default 5 s) → faster start
+            "-loglevel", loglevel,
+        ]
 
         if ss is not None:
             cmd += ["-ss", str(ss)]
@@ -171,6 +224,7 @@ class Call:
             cmd += [
                 "-c:v", "libx264",
                 "-preset", "veryfast",
+                "-tune", "zerolatency",  # flush encoded frames without extra buffering
                 "-b:v", "2000k",
                 "-maxrate", "2000k",
                 "-bufsize", "4000k",
@@ -180,6 +234,7 @@ class Call:
                 "-b:a", "128k",
                 "-ar", "44100",
                 "-ac", "2",
+                "-flush_packets", "1",   # push every packet immediately
                 "-f", "flv",
                 full_url,
             ]
@@ -190,28 +245,45 @@ class Call:
                 "-b:a", "128k",
                 "-ar", "44100",
                 "-ac", "2",
+                "-flush_packets", "1",
                 "-f", "flv",
                 full_url,
             ]
 
+        _log.debug("[FFMPEG] cmd: %s", " ".join(cmd))
         return cmd
 
     async def _start_ffmpeg(self, chat_id: int, cmd: list):
         await self._kill_proc(chat_id)
 
+        _log.debug("[FFMPEG] Starting process for chat_id=%s", chat_id)
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,   # capture stderr for debug logging
         )
         _active_procs[chat_id] = proc
+        _stream_start[chat_id] = time.monotonic()
 
         asyncio.create_task(self._monitor_stream(chat_id, proc))
+        asyncio.create_task(self._log_ffmpeg_stderr(chat_id, proc))
         return proc
+
+    async def _log_ffmpeg_stderr(self, chat_id: int, proc):
+        """Read and debug-log FFmpeg's stderr output."""
+        try:
+            async for line in proc.stderr:
+                decoded = line.decode(errors="replace").rstrip()
+                if decoded:
+                    _log.debug("[FFMPEG stderr] chat=%s | %s", chat_id, decoded)
+        except Exception:
+            pass
 
     async def _kill_proc(self, chat_id: int):
         proc = _active_procs.pop(chat_id, None)
+        _stream_start.pop(chat_id, None)
         if proc is not None and proc.returncode is None:
+            _log.debug("[FFMPEG] Terminating process for chat_id=%s", chat_id)
             try:
                 proc.terminate()
                 await asyncio.wait_for(proc.wait(), timeout=5.0)
@@ -224,41 +296,115 @@ class Call:
         except Exception:
             pass
 
-        if _active_procs.get(chat_id) is proc:
+        # Only trigger auto-advance if this proc is still the registered one
+        # AND the chat hasn't been explicitly stopped
+        if _active_procs.get(chat_id) is proc and chat_id not in _stopped:
             _active_procs.pop(chat_id, None)
+            _stream_start.pop(chat_id, None)
+            _log.debug("[MONITOR] Stream ended normally for chat_id=%s – advancing queue", chat_id)
             await self.change_stream(None, chat_id)
+        else:
+            _log.debug("[MONITOR] Stream ended for chat_id=%s – no queue advance (stopped or replaced)", chat_id)
+        _stopped.discard(chat_id)
+
+    def _get_elapsed_seconds(self, chat_id: int) -> float:
+        """Return seconds elapsed since the current FFmpeg process started."""
+        start = _stream_start.get(chat_id)
+        if start is None:
+            return 0.0
+        return time.monotonic() - start
 
     async def pause_stream(self, chat_id: int):
+        """Pause playback by freezing the FFmpeg process (SIGSTOP).
+
+        The current playback position is recorded so that resume can restart
+        FFmpeg from exactly where we paused, avoiding the buffering artefact
+        that occurs when the RTMP server's buffer drains during a freeze.
+        """
         proc = _active_procs.get(chat_id)
         if proc is not None and proc.returncode is None:
+            # Record position so resume can restart from here
+            try:
+                played_so_far = db[chat_id][0].get("played", 0)
+                elapsed = self._get_elapsed_seconds(chat_id)
+                _paused_pos[chat_id] = played_so_far + elapsed
+                _log.debug("[PAUSE] chat_id=%s paused at %.1f s", chat_id, _paused_pos[chat_id])
+            except Exception:
+                pass
             try:
                 proc.send_signal(signal.SIGSTOP)
-            except Exception:
-                pass
+            except Exception as e:
+                _log.warning("[PAUSE] SIGSTOP failed for chat_id=%s: %s", chat_id, e)
 
     async def resume_stream(self, chat_id: int):
+        """Resume playback.
+
+        Instead of simply sending SIGCONT (which leaves a data gap in the RTMP
+        stream and causes viewer-side buffering), we restart FFmpeg from the
+        saved pause position.  Falls back to SIGCONT if no position was saved
+        or if the file info is unavailable.
+        """
+        paused_at = _paused_pos.pop(chat_id, None)
         proc = _active_procs.get(chat_id)
+
+        if paused_at is not None and proc is not None:
+            # Try to restart from the saved position (preferred – no RTMP gap)
+            try:
+                playing = db.get(chat_id)
+                if playing:
+                    file_path = playing[0].get("speed_path") or playing[0]["file"]
+                    if "live_" not in file_path and "index_" not in file_path:
+                        creds = await get_rtmp_creds(chat_id)
+                        if creds:
+                            rtmp_url, rtmp_key = creds["url"], creds["key"]
+                        else:
+                            rtmp_url, rtmp_key = await self._get_or_create_rtmp_creds(chat_id)
+                        duration = playing[0].get("dur", "00:00")
+                        video = playing[0].get("streamtype") == "video"
+                        seek_to = seconds_to_min(int(paused_at))
+                        cmd = self._build_ffmpeg_cmd(
+                            file_path, rtmp_url, rtmp_key, video=video,
+                            ss=seek_to, to=duration
+                        )
+                        db[chat_id][0]["played"] = int(paused_at)
+                        _log.info("[RESUME] Restarting FFmpeg from %.1f s for chat_id=%s", paused_at, chat_id)
+                        await self._start_ffmpeg(chat_id, cmd)
+                        return
+            except Exception as e:
+                _log.warning("[RESUME] Restart-from-position failed for chat_id=%s: %s – falling back to SIGCONT", chat_id, e)
+
+        # Fallback: thaw the frozen process
         if proc is not None and proc.returncode is None:
+            _log.debug("[RESUME] SIGCONT for chat_id=%s", chat_id)
             try:
                 proc.send_signal(signal.SIGCONT)
-            except Exception:
-                pass
+            except Exception as e:
+                _log.warning("[RESUME] SIGCONT failed for chat_id=%s: %s", chat_id, e)
 
     async def stop_stream(self, chat_id: int):
+        _log.info("[STOP] Stopping stream for chat_id=%s", chat_id)
+        _stopped.add(chat_id)
+        _paused_pos.pop(chat_id, None)
         try:
             await _clear_(chat_id)
             await self._kill_proc(chat_id)
-        except Exception:
-            pass
+        except Exception as e:
+            _log.error("[STOP] Error stopping stream for chat_id=%s: %s", chat_id, e)
 
     async def stop_stream_force(self, chat_id: int):
+        _log.info("[STOP_FORCE] Force-stopping stream for chat_id=%s", chat_id)
+        _stopped.add(chat_id)
+        _paused_pos.pop(chat_id, None)
         try:
             await _clear_(chat_id)
             await self._kill_proc(chat_id)
-        except Exception:
-            pass
+        except Exception as e:
+            _log.error("[STOP_FORCE] Error for chat_id=%s: %s", chat_id, e)
 
     async def force_stop_stream(self, chat_id: int):
+        _log.info("[FORCE_STOP] force_stop_stream for chat_id=%s", chat_id)
+        _stopped.add(chat_id)
+        _paused_pos.pop(chat_id, None)
         try:
             check = db.get(chat_id)
             check.pop(0)
@@ -366,6 +512,30 @@ class Call:
             db[chat_id][0]["speed_path"] = out
             db[chat_id][0]["speed"] = speed
 
+    async def _try_promote_assistant(self, chat_id: int, client) -> None:
+        """Try to promote the assistant account with admin + manage live stream
+        permissions in the given chat.  Failures are logged but not raised since
+        the bot may already have insufficient rights to promote others."""
+        try:
+            await app.promote_chat_member(
+                chat_id,
+                client.id,
+                privileges=ChatPrivileges(
+                    can_manage_chat=True,
+                    can_manage_video_chats=True,
+                    can_invite_users=True,
+                ),
+            )
+            _log.info(
+                "[PROMOTE] Promoted assistant %s as admin in chat %s",
+                client.id, chat_id,
+            )
+        except Exception as e:
+            _log.warning(
+                "[PROMOTE] Could not promote assistant %s in chat %s: %s",
+                client.id, chat_id, e,
+            )
+
     async def join_call(
         self,
         chat_id: int,
@@ -382,8 +552,16 @@ class Call:
         except AssistantErr:
             raise
         except Exception as exc:
-            raise AssistantErr(f"RTMP setup error: {exc}")
+            raise AssistantErr(_["call_11"])
 
+        # Promote the assistant so it can manage the live stream
+        try:
+            assistant_client = await group_assistant(self, chat_id)
+            asyncio.create_task(self._try_promote_assistant(chat_id, assistant_client))
+        except Exception as e:
+            _log.warning("[JOIN] Could not get assistant for promotion in chat %s: %s", chat_id, e)
+
+        _log.info("[JOIN] Starting RTMP stream for chat_id=%s (video=%s)", chat_id, bool(video))
         cmd = self._build_ffmpeg_cmd(link, rtmp_url, rtmp_key, video=bool(video))
         await self._start_ffmpeg(chat_id, cmd)
 
