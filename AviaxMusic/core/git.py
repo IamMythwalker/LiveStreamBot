@@ -1,4 +1,5 @@
 import asyncio
+import os
 import shlex
 from typing import Tuple
 
@@ -30,6 +31,7 @@ def install_req(cmd: str) -> Tuple[str, str, int, int]:
 
 
 def git():
+    os.environ["GIT_TERMINAL_PROMPT"] = "0"
     REPO_LINK = config.UPSTREAM_REPO
     if config.GIT_TOKEN:
         GIT_USERNAME = REPO_LINK.split("com/")[1].split("/")[0]
@@ -48,24 +50,31 @@ def git():
             origin = repo.remote("origin")
         else:
             origin = repo.create_remote("origin", UPSTREAM_REPO)
-        origin.fetch()
-        repo.create_head(
-            config.UPSTREAM_BRANCH,
-            origin.refs[config.UPSTREAM_BRANCH],
-        )
-        repo.heads[config.UPSTREAM_BRANCH].set_tracking_branch(
-            origin.refs[config.UPSTREAM_BRANCH]
-        )
-        repo.heads[config.UPSTREAM_BRANCH].checkout(True)
         try:
-            repo.create_remote("origin", config.UPSTREAM_REPO)
-        except BaseException:
-            pass
-        nrs = repo.remote("origin")
-        nrs.fetch(config.UPSTREAM_BRANCH)
-        try:
-            nrs.pull(config.UPSTREAM_BRANCH)
-        except GitCommandError:
-            repo.git.reset("--hard", "FETCH_HEAD")
-        install_req("pip3 install --no-cache-dir -r requirements.txt")
-        LOGGER(__name__).info(f"Fetching updates from upstream repository...")
+            origin.fetch()
+            repo.create_head(
+                config.UPSTREAM_BRANCH,
+                origin.refs[config.UPSTREAM_BRANCH],
+            )
+            repo.heads[config.UPSTREAM_BRANCH].set_tracking_branch(
+                origin.refs[config.UPSTREAM_BRANCH]
+            )
+            repo.heads[config.UPSTREAM_BRANCH].checkout(True)
+            try:
+                repo.create_remote("origin", config.UPSTREAM_REPO)
+            except BaseException:
+                pass
+            nrs = repo.remote("origin")
+            nrs.fetch(config.UPSTREAM_BRANCH)
+            try:
+                nrs.pull(config.UPSTREAM_BRANCH)
+            except GitCommandError:
+                repo.git.reset("--hard", "FETCH_HEAD")
+            install_req("pip3 install --no-cache-dir -r requirements.txt")
+            LOGGER(__name__).info(f"Fetching updates from upstream repository...")
+        except GitCommandError as e:
+            LOGGER(__name__).warning(
+                f"Unable to fetch from upstream repository: {e}\n"
+                "Check your UPSTREAM_REPO URL, network connectivity, "
+                "and set GIT_TOKEN if the repository is private."
+            )
