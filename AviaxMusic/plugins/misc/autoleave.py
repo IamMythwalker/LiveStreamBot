@@ -1,7 +1,6 @@
 import asyncio
 from datetime import datetime
 from pyrogram.enums import ChatType
-from pytgcalls.exceptions import GroupCallNotFound
 import config
 from AviaxMusic import app
 from AviaxMusic.misc import db
@@ -53,18 +52,14 @@ async def auto_end():
                 continue
             chatss = autoend
             keys_to_remove = []
-            nocall = False
             for chat_id in chatss:
-                try:
-                    users = len(await Aviax.call_listeners(chat_id))
-                except GroupCallNotFound:
-                    users = 1
-                    nocall = True
-                except Exception:
-                    users = 100
+                # In RTMP mode call_listeners always returns [] (no participant
+                # counting available).  We treat 0 listeners the same as 1
+                # (only the stream itself) so auto-end still fires correctly.
+                users = len(await Aviax.call_listeners(chat_id))
                 timer = autoend.get(chat_id)
-                if users == 1:
-                    res = await set_loop(chat_id, 0)
+                if users <= 1:
+                    await set_loop(chat_id, 0)
                     keys_to_remove.append(chat_id)
                     try:
                         await db[chat_id][0]["mystic"].delete()
@@ -75,8 +70,7 @@ async def auto_end():
                     except Exception:
                         pass
                     try:
-                        if not nocall:
-                            await app.send_message(chat_id, "» ʙᴏᴛ ᴀᴜᴛᴏᴍᴀᴛɪᴄᴀʟʟʏ ʟᴇғᴛ ᴠɪᴅᴇᴏᴄʜᴀᴛ ʙᴇᴄᴀᴜsᴇ ɴᴏ ᴏɴᴇ ᴡᴀs ʟɪsᴛᴇɴɪɴɢ ᴏɴ ᴠɪᴅᴇᴏᴄʜᴀᴛ.")
+                        await app.send_message(chat_id, "» ʙᴏᴛ ᴀᴜᴛᴏᴍᴀᴛɪᴄᴀʟʟʏ ʟᴇғᴛ ᴠɪᴅᴇᴏᴄʜᴀᴛ ʙᴇᴄᴀᴜsᴇ ɴᴏ ᴏɴᴇ ᴡᴀs ʟɪsᴛᴇɴɪɴɢ ᴏɴ ᴠɪᴅᴇᴏᴄʜᴀᴛ.")
                     except Exception:
                         pass
             for chat_id in keys_to_remove:
