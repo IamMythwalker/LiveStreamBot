@@ -120,6 +120,7 @@ def PlayWrapper(command):
                 try:
                     get = await app.get_chat_member(chat_id, userbot.id)
                 except ChatAdminRequired:
+                    # Bot needs add-admin + manage-live-stream permissions
                     return await message.reply_text(_["call_1"])
                 if (
                     get.status == ChatMemberStatus.BANNED
@@ -142,8 +143,10 @@ def PlayWrapper(command):
                             pass
                     else:
                         try:
+                            # Requires "Add Members" / "Invite Users" permission
                             invitelink = await app.export_chat_invite_link(chat_id)
                         except ChatAdminRequired:
+                            # Missing required permission – show the updated message
                             return await message.reply_text(_["call_1"])
                         except Exception as e:
                             return await message.reply_text(
