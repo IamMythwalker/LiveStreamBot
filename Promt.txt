@@ -1,0 +1,557 @@
+#!/usr/bin/env python3
+"""
+RTMP Livestream Manager Bot — single file, hardcoded creds.
+Bot  → manages commands, invites assistant, promotes it.
+Assistant (userbot via StringSession) → creates RTMP stream, fetches URL.
+
+Requirements:
+    pip install pyrogram tgcrypto
+
+Generate a StringSession first (run once):
+    from pyrogram import Client
+    with Client("session", api_id=API_ID, api_hash=API_HASH) as c:
+        print(c.export_session_string())
+"""
+
+import asyncio
+import sqlite3
+import logging
+import time
+import random
+import sys
+
+from pyrogram import Client, filters, enums, idle
+from pyrogram.types import ChatPrivileges
+from pyrogram.raw import functions
+from pyrogram.raw import types as raw_types
+from pyrogram.errors import (
+    ChatAdminRequired,
+    FloodWait,
+    UserNotParticipant,
+    RPCError,
+    PeerIdInvalid,
+    ChannelInvalid,
+    ChatIdInvalid,
+    UserAlreadyParticipant,
+    BotMethodInvalid,
+)
+
+# ═══════════════════════  HARD-CODED CONFIG  ═══════════════════════
+BOT_TOKEN      = "8047973942:AAGiJgLv38WDicFQncPFwF8Yw8EtWNLkycg"
+API_ID         = 30827220                          # from my.telegram.org
+API_HASH       = "c40003b5e5c441e4d864e25ec4840be3"   # from my.telegram.org
+STRING_SESSION = "AQHkeDsAYAf-pksljoIPg76PeRc5YNoxvaIfArLt9uepdW68kpgf_xpaCV2k1h7tQDU-Qj3MsqOaQX3GB9aKDhUlhfrjv-RKw8XIDIble-TcYhOv4KwjbI7a2B6-I7U0VTdtDi-jkPARAthM73q1zLJszgKNMndFhZbnCQg4jR2XJidu9Kg6OOZue6Ru5Ik1NGq2G-pN4EVfXkMSULKLf1i9hm9kP1fOvZ-9A83blE_YpvzgIMyreJVZQEKul07S_Ovh0jy6z6AeacpKtJa0pQdV6Y83WgLEzG10ygsg1_uzIaK4ntXa5bdAeifQstm92r9OmYM7B7ERTKYhYXxVhqCJoXFgtwAAAAGuLPVvAA"    # assistant / userbot
+OWNER_ID       = 7269251740                          # your personal TG id
+# ═══════════════════════════════════════════════════════════════════
+
+# ─── logging ───
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s │ %(levelname)-7s │ %(name)s │ %(message)s",
+)
+log = logging.getLogger("RTMP")
+
+# ─── database (sqlite, same file) ───
+_db = sqlite3.connect("rtmp.db", check_same_thread=False)
+_cu = _db.cursor()
+_cu.execute("""
+    CREATE TABLE IF NOT EXISTS chats (
+        chat_id     INTEGER PRIMARY KEY,
+        rtmp_url    TEXT    DEFAULT NULL,
+        rtmp_key    TEXT    DEFAULT NULL,
+        is_live     INTEGER DEFAULT 0,
+        assistant   INTEGER DEFAULT 0,
+        updated     TEXT    DEFAULT ''
+    )
+""")
+_db.commit()
+
+
+def db_get(cid: int) -> dict | None:
+    _cu.execute(
+        "SELECT chat_id,rtmp_url,rtmp_key,is_live,assistant,updated "
+        "FROM chats WHERE chat_id=?", (cid,),
+    )
+    r = _cu.fetchone()
+    if not r:
+        return None
+    return dict(zip(
+        ("chat_id", "rtmp_url", "rtmp_key", "is_live", "assistant", "updated"), r
+    ))
+
+
+def db_set(cid: int, **kw):
+    kw["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    if db_get(cid):
+        s = ", ".join(f"{k}=?" for k in kw)
+        _cu.execute(f"UPDATE chats SET {s} WHERE chat_id=?",
+                     (*kw.values(), cid))
+    else:
+        kw["chat_id"] = cid
+        cols = ", ".join(kw)
+        phs  = ", ".join(["?"] * len(kw))
+        _cu.execute(f"INSERT INTO chats ({cols}) VALUES ({phs})",
+                     tuple(kw.values()))
+    _db.commit()
+
+
+# ─── pyrogram clients ───
+bot = Client(
+    "rtmp_bot",
+    bot_token=BOT_TOKEN,
+    api_id=API_ID,
+    api_hash=API_HASH,
+)
+assistant = Client(
+    "rtmp_assistant",
+    session_string=STRING_SESSION,
+    api_id=API_ID,
+    api_hash=API_HASH,
+)
+
+ASS_ID: int   = 0
+ASS_NAME: str = ""
+
+
+# ══════════════════════  HELPER FUNCTIONS  ══════════════════════
+
+
+async def chat_log(cid: int, text: str):
+    """Send an in-chat log line via the bot."""
+    try:
+        await bot.send_message(cid, f"📋 **Log:** {text}")
+    except Exception as exc:
+        log.warning("chat_log(%s) failed: %s", cid, exc)
+
+
+async def is_group_admin(cid: int, uid: int) -> bool:
+    if uid == OWNER_ID:
+        return True
+    try:
+        m = await bot.get_chat_member(cid, uid)
+        return m.status in (
+            enums.ChatMemberStatus.ADMINISTRATOR,
+            enums.ChatMemberStatus.OWNER,
+        )
+    except Exception:
+        return False
+
+
+async def bot_privs(cid: int) -> ChatPrivileges | None:
+    """Return the bot's ChatPrivileges in *cid*, or None."""
+    try:
+        me = await bot.get_me()
+        m  = await bot.get_chat_member(cid, me.id)
+        if m.status == enums.ChatMemberStatus.OWNER:
+            return ChatPrivileges(
+                can_manage_video_chats=True,
+                can_invite_users=True,
+                can_promote_members=True,
+                can_manage_chat=True,
+            )
+        return m.privileges
+    except Exception:
+        return None
+
+
+async def get_full_chat(cid: int):
+    """Return FullChat (works for supergroups, channels AND basic groups)."""
+    peer = await assistant.resolve_peer(cid)
+    if isinstance(peer, raw_types.InputPeerChannel):
+        return await assistant.invoke(
+            functions.channels.GetFullChannel(
+                channel=raw_types.InputChannel(
+                    channel_id=peer.channel_id,
+                    access_hash=peer.access_hash,
+                )
+            )
+        )
+    if isinstance(peer, raw_types.InputPeerChat):
+        return await assistant.invoke(
+            functions.messages.GetFullChat(chat_id=peer.chat_id)
+        )
+    raise ValueError(f"Unexpected peer type {type(peer).__name__}")
+
+
+# ─── assistant join ───
+async def join_assistant(cid: int) -> tuple[bool, str]:
+    """Make sure the assistant is in the chat."""
+    # already there?
+    try:
+        m = await bot.get_chat_member(cid, ASS_ID)
+        if m.status not in (
+            enums.ChatMemberStatus.BANNED,
+            enums.ChatMemberStatus.LEFT,
+        ):
+            return True, "already in chat"
+    except (UserNotParticipant, RPCError):
+        pass
+    except Exception:
+        pass
+
+    # method 1 – bot adds directly
+    try:
+        await bot.add_chat_members(cid, ASS_ID)
+        await asyncio.sleep(1)
+        return True, "added by bot"
+    except Exception as e1:
+        log.info("add_chat_members failed: %s", e1)
+
+    # method 2 – invite link
+    try:
+        link = await bot.export_chat_invite_link(cid)
+        await assistant.join_chat(link)
+        await asyncio.sleep(1)
+        return True, "joined via invite link"
+    except Exception as e2:
+        log.info("invite-link join failed: %s", e2)
+
+    # method 3 – public username
+    try:
+        chat = await bot.get_chat(cid)
+        if chat.username:
+            await assistant.join_chat(chat.username)
+            await asyncio.sleep(1)
+            return True, "joined via @username"
+    except Exception as e3:
+        log.info("public join failed: %s", e3)
+
+    return False, "all join methods failed — check bans/privacy"
+
+
+# ─── promote ───
+async def promote_assistant(cid: int) -> tuple[bool, str]:
+    try:
+        await bot.promote_chat_member(
+            cid,
+            ASS_ID,
+            privileges=ChatPrivileges(
+                can_manage_video_chats=True,
+                can_invite_users=True,
+            ),
+        )
+        return True, "promoted ✅"
+    except ChatAdminRequired:
+        return False, "bot lacks 'Add New Admins' right"
+    except Exception as exc:
+        return False, str(exc)
+
+
+# ─── RTMP stream ───
+async def create_rtmp(cid: int) -> tuple[str, str]:
+    """Create an RTMP group-call and return (url, key)."""
+    peer = await assistant.resolve_peer(cid)
+
+    # create group call with rtmp flag
+    try:
+        await assistant.invoke(
+            functions.phone.CreateGroupCall(
+                peer=peer,
+                rtmp_stream=True,
+                random_id=random.randint(1, 2**31 - 1),
+                title="Live Stream",
+            )
+        )
+        log.info("Created RTMP call in %s", cid)
+    except RPCError as exc:
+        upper = str(exc).upper()
+        if "GROUPCALL_ALREADY_STARTED" in upper or "ALREADY_STARTED" in upper:
+            log.info("Group call already active in %s — reusing", cid)
+        else:
+            raise
+
+    # fetch rtmp url
+    result = await assistant.invoke(
+        functions.phone.GetGroupCallStreamRtmpUrl(
+            peer=peer,
+            revoke=False,
+        )
+    )
+    return result.url, result.key
+
+
+async def live_check(cid: int) -> bool:
+    """Return True if a group-call / livestream is active."""
+    try:
+        full = await get_full_chat(cid)
+        return full.full_chat.call is not None
+    except Exception as exc:
+        log.warning("live_check(%s): %s", cid, exc)
+        return False
+
+
+async def end_stream(cid: int) -> tuple[bool, str]:
+    try:
+        full = await get_full_chat(cid)
+        if not full.full_chat.call:
+            return False, "no active group call"
+        await assistant.invoke(
+            functions.phone.DiscardGroupCall(call=full.full_chat.call)
+        )
+        return True, "stream ended"
+    except Exception as exc:
+        return False, str(exc)
+
+
+# ══════════════════════  BOT COMMANDS  ══════════════════════
+
+GROUP_FILTER = filters.group | filters.channel
+
+
+@bot.on_message(filters.command("start") & filters.private)
+async def cmd_start(_, msg):
+    await msg.reply_text(
+        "🎥 **RTMP Livestream Bot**\n\n"
+        "Add me to a group / channel and use:\n\n"
+        "  /initiate — invite assistant, start RTMP, store creds\n"
+        "  /status   — check stored RTMP URL & live state\n"
+        "  /revoke   — regenerate RTMP URL + key\n"
+        "  /stop     — end the livestream\n"
+        "  /leave    — remove assistant from chat (owner)\n"
+        "  /id       — show chat / user IDs\n",
+        disable_web_page_preview=True,
+    )
+
+
+@bot.on_message(filters.command("help"))
+async def cmd_help(c, msg):
+    await cmd_start(c, msg)
+
+
+# ─── /id ───
+@bot.on_message(filters.command("id"))
+async def cmd_id(_, msg):
+    uid = msg.from_user.id if msg.from_user else "N/A"
+    await msg.reply_text(
+        f"👤 **Your ID:** `{uid}`\n"
+        f"💬 **Chat ID:** `{msg.chat.id}`\n"
+        f"🤖 **Assistant ID:** `{ASS_ID}`",
+    )
+
+
+# ─── /status ───
+@bot.on_message(filters.command("status") & GROUP_FILTER)
+async def cmd_status(_, msg):
+    cid  = msg.chat.id
+    data = db_get(cid)
+
+    if not data:
+        return await msg.reply_text(
+            "❌ **No RTMP data stored for this chat.**\n"
+            "Run /initiate to set everything up.",
+        )
+
+    # refresh live flag
+    try:
+        live = await live_check(cid)
+        db_set(cid, is_live=int(live))
+    except Exception:
+        live = bool(data.get("is_live"))
+
+    url = data.get("rtmp_url") or "—"
+    key = data.get("rtmp_key") or "—"
+    ass = "✅ Yes" if data.get("assistant") else "❌ No"
+    lvs = "🟢 Active" if live else "🔴 Inactive"
+    upd = data.get("updated") or "—"
+
+    await msg.reply_text(
+        f"📊 **RTMP Status**\n\n"
+        f"**RTMP URL:**\n`{url}`\n\n"
+        f"**RTMP Key:**\n`{key}`\n\n"
+        f"**Livestream:** {lvs}\n"
+        f"**Assistant in chat:** {ass}\n"
+        f"**Last updated:** `{upd}`",
+    )
+
+
+# ─── /initiate ───
+@bot.on_message(filters.command("initiate") & GROUP_FILTER)
+async def cmd_initiate(_, msg):
+    cid = msg.chat.id
+    uid = msg.from_user.id if msg.from_user else 0
+
+    if not await is_group_admin(cid, uid):
+        return await msg.reply_text("⛔ Only group admins can run this.")
+
+    s = await msg.reply_text("⏳ **RTMP Setup**\n\n`[1/5]` Checking bot permissions …")
+
+    # ── step 1: bot permissions ──
+    priv = await bot_privs(cid)
+    if not priv:
+        return await s.edit_text(
+            "❌ I am **not an admin** here.\n"
+            "Promote me with at least:\n"
+            "• Manage Video Chats\n• Invite Users\n• Add New Admins",
+        )
+
+    if not getattr(priv, "can_manage_video_chats", False):
+        return await s.edit_text(
+            "❌ I need the **Manage Video Chats** permission.",
+        )
+
+    if not getattr(priv, "can_invite_users", False):
+        return await s.edit_text(
+            "❌ I need the **Invite Users** permission.",
+        )
+
+    if not getattr(priv, "can_promote_members", False):
+        await s.edit_text(
+            "❌ I need **Add New Admins** (promote members) permission "
+            "so I can make the assistant an admin.\n\n"
+            "Please grant it and run /initiate again.\n"
+            "_Leaving the chat …_",
+        )
+        await asyncio.sleep(3)
+        try:
+            await bot.leave_chat(cid)
+        except Exception:
+            pass
+        return
+
+    # ── step 2: invite assistant ──
+    await s.edit_text("⏳ **RTMP Setup**\n\n`[2/5]` Inviting assistant …")
+    ok, info = await join_assistant(cid)
+    if not ok:
+        return await s.edit_text(f"❌ Could not add assistant.\n`{info}`")
+    await chat_log(cid, f"Assistant → {info}")
+    db_set(cid, assistant=1)
+
+    # ── step 3: promote assistant ──
+    await s.edit_text("⏳ **RTMP Setup**\n\n`[3/5]` Promoting assistant …")
+    ok, info = await promote_assistant(cid)
+    if not ok:
+        return await s.edit_text(f"❌ Promote failed.\n`{info}`")
+    await chat_log(cid, f"Promotion → {info}")
+
+    # let Telegram propagate the admin change
+    await asyncio.sleep(3)
+
+    # ── step 4: start RTMP stream ──
+    await s.edit_text("⏳ **RTMP Setup**\n\n`[4/5]` Starting RTMP livestream …")
+    try:
+        url, key = await create_rtmp(cid)
+    except FloodWait as fw:
+        return await s.edit_text(
+            f"⚠️ Telegram rate-limit. Retry in **{fw.value}** seconds.",
+        )
+    except RPCError as exc:
+        return await s.edit_text(f"❌ Telegram API error:\n`{exc}`")
+    except Exception as exc:
+        return await s.edit_text(
+            f"❌ Unexpected error:\n`{type(exc).__name__}: {exc}`",
+        )
+
+    # ── step 5: save ──
+    await s.edit_text("⏳ **RTMP Setup**\n\n`[5/5]` Saving to database …")
+    db_set(cid, rtmp_url=url, rtmp_key=key, is_live=1, assistant=1)
+    await chat_log(cid, "RTMP credentials saved to DB ✅")
+
+    await s.edit_text(
+        "✅ **RTMP Livestream Ready!**\n\n"
+        f"**RTMP URL:**\n`{url}`\n\n"
+        f"**RTMP Key:**\n`{key}`\n\n"
+        "Paste these into OBS / your streaming software and press Start.\n"
+        "Use /status to check anytime.",
+    )
+    log.info("RTMP setup complete for chat %s", cid)
+
+
+# ─── /revoke ───
+@bot.on_message(filters.command("revoke") & GROUP_FILTER)
+async def cmd_revoke(_, msg):
+    cid = msg.chat.id
+    uid = msg.from_user.id if msg.from_user else 0
+    if not await is_group_admin(cid, uid):
+        return await msg.reply_text("⛔ Admins only.")
+
+    s = await msg.reply_text("⏳ Revoking & regenerating RTMP credentials …")
+    try:
+        peer = await assistant.resolve_peer(cid)
+        r = await assistant.invoke(
+            functions.phone.GetGroupCallStreamRtmpUrl(peer=peer, revoke=True)
+        )
+        db_set(cid, rtmp_url=r.url, rtmp_key=r.key)
+        await s.edit_text(
+            "✅ **New RTMP Credentials**\n\n"
+            f"**URL:**\n`{r.url}`\n\n"
+            f"**Key:**\n`{r.key}`",
+        )
+    except FloodWait as fw:
+        await s.edit_text(f"⚠️ FloodWait — retry in {fw.value}s")
+    except Exception as exc:
+        await s.edit_text(f"❌ Failed:\n`{exc}`")
+
+
+# ─── /stop ───
+@bot.on_message(filters.command("stop") & GROUP_FILTER)
+async def cmd_stop(_, msg):
+    cid = msg.chat.id
+    uid = msg.from_user.id if msg.from_user else 0
+    if not await is_group_admin(cid, uid):
+        return await msg.reply_text("⛔ Admins only.")
+
+    s = await msg.reply_text("⏳ Stopping livestream …")
+    ok, info = await end_stream(cid)
+    if ok:
+        db_set(cid, is_live=0)
+        await s.edit_text("✅ Livestream stopped.")
+        await chat_log(cid, "Stream stopped by admin.")
+    else:
+        await s.edit_text(f"ℹ️ {info}")
+
+
+# ─── /leave (owner only) ───
+@bot.on_message(filters.command("leave") & GROUP_FILTER)
+async def cmd_leave(_, msg):
+    if (msg.from_user.id if msg.from_user else 0) != OWNER_ID:
+        return
+    cid = msg.chat.id
+    try:
+        await assistant.leave_chat(cid)
+        db_set(cid, assistant=0)
+        await msg.reply_text("✅ Assistant left the group.")
+    except Exception as exc:
+        await msg.reply_text(f"❌ {exc}")
+
+
+# ══════════════════════  ENTRYPOINT  ══════════════════════
+
+async def main():
+    global ASS_ID, ASS_NAME
+
+    log.info("Starting bot client …")
+    await bot.start()
+
+    log.info("Starting assistant client …")
+    await assistant.start()
+
+    me_a = await assistant.get_me()
+    ASS_ID   = me_a.id
+    ASS_NAME = me_a.first_name or "Assistant"
+
+    me_b = await bot.get_me()
+    log.info("─" * 50)
+    log.info("Bot       : @%s  [%s]", me_b.username, me_b.id)
+    log.info("Assistant : %s  [%s]", ASS_NAME, ASS_ID)
+    log.info("Owner     : %s", OWNER_ID)
+    log.info("─" * 50)
+    print("\n✅  Both clients running.  Press Ctrl+C to stop.\n")
+
+    await idle()          # blocks until SIGINT / SIGTERM
+
+    log.info("Shutting down …")
+    await assistant.stop()
+    await bot.stop()
+    _db.close()
+    log.info("Bye.")
+
+
+if __name__ == "__main__":
+    bot.run(main())
+
+
+Please integrate the given code in this repository 
+Without changing any other core logic, implement this userbot chat joining and rtmp cred extraction logic. The bot should check if it has rights to add admin, invite user and manage live stream in chat. If any user tries to play any song just like in current code check bot's current admin rights if it doesn't have any admin rights then send a notification to user that it needs admin.
+And it should check if the rtmp creds are stored in db of that chat and then try to play the stream if the token is revoked or is not stored then add userbot promote it to admin the extract and save creds after that make the userbot leave that chat for the next time.
+And before sending stream_ msgs from yml check if the stream is actually started and running, if not end the current vc start a streaming voice chat
+dont alter the streaming part keep the same fonts and also only change what is required and also use the code i gave as refrence and make it like that only dont alter the streaming part a lil bit too oke and also keep it clean 
