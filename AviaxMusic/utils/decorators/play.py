@@ -115,6 +115,27 @@ def PlayWrapper(command):
             fplay = None
 
         if not await is_active_chat(chat_id):
+            # Check bot's admin rights before trying to start a stream
+            try:
+                bot_member = await app.get_chat_member(chat_id, (await app.get_me()).id)
+                if bot_member.status not in (
+                    ChatMemberStatus.ADMINISTRATOR,
+                    ChatMemberStatus.OWNER,
+                ):
+                    return await message.reply_text(_["call_11"])
+                privs = bot_member.privileges
+                if privs:
+                    if not getattr(privs, "can_manage_video_chats", False):
+                        return await message.reply_text(_["call_11"])
+                    if not getattr(privs, "can_invite_users", False):
+                        return await message.reply_text(_["call_11"])
+                    if not getattr(privs, "can_promote_members", False):
+                        return await message.reply_text(_["call_11"])
+            except ChatAdminRequired:
+                return await message.reply_text(_["call_11"])
+            except Exception:
+                pass
+
             userbot = await get_assistant(chat_id)
             try:
                 try:

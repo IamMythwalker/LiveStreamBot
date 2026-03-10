@@ -6,8 +6,10 @@ from datetime import datetime, timedelta
 from typing import Union
 
 from pyrogram import Client
+from pyrogram.errors import RPCError
 from pyrogram.raw import functions
-from pyrogram.types import InlineKeyboardMarkup
+from pyrogram.raw import types as raw_types
+from pyrogram.types import ChatPrivileges, InlineKeyboardMarkup
 
 import config
 from AviaxMusic import LOGGER, YouTube, app
@@ -101,7 +103,14 @@ class Call:
         self.five = self.userbot5
 
     async def _get_or_create_rtmp_creds(self, chat_id: int):
-        """Return (url, key) for the RTMP ingest endpoint of chat_id."""
+        """Return (url, key) for the RTMP ingest endpoint of chat_id.
+
+        If no creds are stored in cache/DB the method will:
+          1. Promote the userbot to admin (manage video chats + invite users).
+          2. Create an RTMP group call if none is active.
+          3. Fetch the RTMP URL/key and persist them.
+          4. Make the userbot leave the chat (it is no longer needed).
+        """
         creds = await get_rtmp_creds(chat_id)
         if not creds:
             creds = await load_rtmp_creds(chat_id)
@@ -115,6 +124,22 @@ class Call:
         except Exception as exc:
             raise AssistantErr(f"Failed to resolve peer for chat {chat_id}: {exc}")
 
+        # Promote the userbot so it can manage the RTMP stream
+        try:
+            await app.promote_chat_member(
+                chat_id,
+                client.id,
+                privileges=ChatPrivileges(
+                    can_manage_video_chats=True,
+                    can_invite_users=True,
+                ),
+            )
+            # Allow Telegram to propagate the admin-rights change
+            await asyncio.sleep(2)
+        except Exception as exc:
+            raise AssistantErr(f"Failed to promote assistant: {exc}")
+
+        # Try to get an existing RTMP URL first
         try:
             result = await client.invoke(
                 functions.phone.GetGroupCallStreamRtmpUrl(
@@ -125,6 +150,7 @@ class Call:
             url = result.url
             key = result.key
         except Exception:
+            # No active RTMP call — create one
             try:
                 await client.invoke(
                     functions.phone.CreateGroupCall(
@@ -134,6 +160,38 @@ class Call:
                     )
                 )
                 await asyncio.sleep(1)
+            except RPCError as exc:
+                upper = str(exc).upper()
+                if "GROUPCALL_ALREADY_STARTED" in upper or "ALREADY_STARTED" in upper:
+                    # A non-RTMP call is active — end it and start an RTMP one
+                    try:
+                        full = await self._get_full_chat(client, peer)
+                        if full and full.full_chat.call:
+                            await client.invoke(
+                                functions.phone.DiscardGroupCall(
+                                    call=full.full_chat.call
+                                )
+                            )
+                            await asyncio.sleep(1)
+                    except Exception:
+                        pass
+                    try:
+                        await client.invoke(
+                            functions.phone.CreateGroupCall(
+                                peer=peer,
+                                random_id=random.randint(1, 2**31 - 1),
+                                rtmp_stream=True,
+                            )
+                        )
+                        await asyncio.sleep(1)
+                    except Exception as exc2:
+                        raise AssistantErr(f"Failed to create RTMP call: {exc2}")
+                else:
+                    raise AssistantErr(f"Failed to create group call: {exc}")
+            except Exception as exc:
+                raise AssistantErr(f"Failed to create group call: {exc}")
+
+            try:
                 result = await client.invoke(
                     functions.phone.GetGroupCallStreamRtmpUrl(
                         peer=peer,
@@ -146,7 +204,39 @@ class Call:
                 raise AssistantErr(f"Failed to get RTMP credentials: {exc2}")
 
         await set_rtmp_creds(chat_id, url, key)
+
+        # Userbot is no longer needed — leave the chat
+        try:
+            await client.leave_chat(chat_id)
+        except Exception:
+            pass
+
         return url, key
+
+    async def _get_full_chat(self, client, peer):
+        """Return the FullChat object for the given peer (channel or basic group)."""
+        try:
+            if isinstance(peer, raw_types.InputPeerChannel):
+                return await client.invoke(
+                    functions.channels.GetFullChannel(
+                        channel=raw_types.InputChannel(
+                            channel_id=peer.channel_id,
+                            access_hash=peer.access_hash,
+                        )
+                    )
+                )
+            if isinstance(peer, raw_types.InputPeerChat):
+                return await client.invoke(
+                    functions.messages.GetFullChat(chat_id=peer.chat_id)
+                )
+        except Exception:
+            pass
+        return None
+
+    def is_stream_active(self, chat_id: int) -> bool:
+        """Return True if an FFmpeg RTMP process is currently running for this chat."""
+        proc = _active_procs.get(chat_id)
+        return proc is not None and proc.returncode is None
 
     def _build_ffmpeg_cmd(
         self,
@@ -386,6 +476,26 @@ class Call:
 
         cmd = self._build_ffmpeg_cmd(link, rtmp_url, rtmp_key, video=bool(video))
         await self._start_ffmpeg(chat_id, cmd)
+
+        # Verify the stream actually started; if FFmpeg exited quickly the
+        # RTMP credentials are likely stale or revoked — clear them and retry once.
+        # 3 s is enough for FFmpeg to fail fast on a bad RTMP URL while still
+        # being well below the time a successful stream takes to exit.
+        await asyncio.sleep(3)
+        if not self.is_stream_active(chat_id):
+            await del_rtmp_creds(chat_id)
+            try:
+                rtmp_url, rtmp_key = await self._get_or_create_rtmp_creds(chat_id)
+            except AssistantErr:
+                raise
+            except Exception as exc:
+                raise AssistantErr(f"RTMP setup error on retry: {exc}")
+            cmd = self._build_ffmpeg_cmd(link, rtmp_url, rtmp_key, video=bool(video))
+            await self._start_ffmpeg(chat_id, cmd)
+            # Shorter wait on the second attempt
+            await asyncio.sleep(2)
+            if not self.is_stream_active(chat_id):
+                raise AssistantErr(_["call_8"])
 
         await add_active_chat(chat_id)
         await music_on(chat_id)
